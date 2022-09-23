@@ -272,13 +272,26 @@ CATCH_RETURN()
 {
     RETURN_HR_IF_NULL(E_INVALIDARG, pResult);
 
+    wil::com_ptr<IDWriteTextFormat> textFormat;
+    RETURN_IF_FAILED(_sr.dwriteFactory->CreateTextFormat(
+        /* fontFamilyName */ _api.fontMetrics.fontName.c_str(),
+        /* fontCollection */ _api.fontMetrics.fontCollection.get(),
+        /* fontWeight     */ static_cast<DWRITE_FONT_WEIGHT>(_api.fontMetrics.fontWeight),
+        /* fontStyle      */ DWRITE_FONT_STYLE_NORMAL,
+        /* fontStretch    */ DWRITE_FONT_STRETCH_NORMAL,
+        /* fontSize       */ _api.fontMetrics.fontSizeInDIP,
+        /* localeName     */ L"",
+        /* textFormat     */ textFormat.put()));
+
     wil::com_ptr<IDWriteTextLayout> textLayout;
-    RETURN_IF_FAILED(_sr.dwriteFactory->CreateTextLayout(glyph.data(), gsl::narrow_cast<uint32_t>(glyph.size()), _getTextFormat(false, false), FLT_MAX, FLT_MAX, textLayout.addressof()));
+    RETURN_IF_FAILED(_sr.dwriteFactory->CreateTextLayout(glyph.data(), gsl::narrow_cast<uint32_t>(glyph.size()), textFormat.get(), FLT_MAX, FLT_MAX, textLayout.addressof()));
 
     DWRITE_TEXT_METRICS metrics;
     RETURN_IF_FAILED(textLayout->GetMetrics(&metrics));
 
-    *pResult = static_cast<unsigned int>(std::ceilf(metrics.width)) > _api.fontMetrics.cellSize.x;
+    const auto minWidth = (_api.fontMetrics.cellSize.x * 1.2f);
+    const auto width = metrics.width * GetScaling();
+    *pResult = width > minWidth;
     return S_OK;
 }
 

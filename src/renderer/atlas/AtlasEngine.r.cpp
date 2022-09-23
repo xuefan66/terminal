@@ -15,12 +15,15 @@
 // The _api fields on the other hand are concurrently written to by others.
 
 #pragma warning(disable : 4100) // '...': unreferenced formal parameter
+#pragma warning(disable : 4127)
 // Disable a bunch of warnings which get in the way of writing performant code.
 #pragma warning(disable : 26429) // Symbol 'data' is never tested for nullness, it can be marked as not_null (f.23).
 #pragma warning(disable : 26446) // Prefer to use gsl::at() instead of unchecked subscript operator (bounds.4).
 #pragma warning(disable : 26459) // You called an STL function '...' with a raw pointer parameter at position '...' that may be unsafe [...].
 #pragma warning(disable : 26481) // Don't use pointer arithmetic. Use span instead (bounds.1).
 #pragma warning(disable : 26482) // Only index into arrays using constant expressions (bounds.2).
+
+using namespace Microsoft::Console::Render;
 
 // https://en.wikipedia.org/wiki/Inversion_list
 template<size_t N>
@@ -54,7 +57,62 @@ constexpr T colorFromU32(uint32_t rgba)
     return { r, g, b, a };
 }
 
-using namespace Microsoft::Console::Render;
+static AtlasEngine::f32r getGlyphRunBlackBox(const DWRITE_GLYPH_RUN& glyphRun, float baselineX, float baselineY)
+{
+    DWRITE_FONT_METRICS fontMetrics;
+    glyphRun.fontFace->GetMetrics(&fontMetrics);
+
+    std::unique_ptr<DWRITE_GLYPH_METRICS[]> glyphRunMetricsHeap;
+    std::array<DWRITE_GLYPH_METRICS, 8> glyphRunMetricsStack;
+    DWRITE_GLYPH_METRICS* glyphRunMetrics = glyphRunMetricsStack.data();
+
+    if (glyphRun.glyphCount > glyphRunMetricsStack.size())
+    {
+        glyphRunMetricsHeap = std::make_unique_for_overwrite<DWRITE_GLYPH_METRICS[]>(glyphRun.glyphCount);
+        glyphRunMetrics = glyphRunMetricsHeap.get();
+    }
+
+    glyphRun.fontFace->GetDesignGlyphMetrics(glyphRun.glyphIndices, glyphRun.glyphCount, glyphRunMetrics, false);
+
+    float const fontScale = glyphRun.fontEmSize / fontMetrics.designUnitsPerEm;
+    AtlasEngine::f32r accumulatedBounds{
+        FLT_MAX,
+        FLT_MAX,
+        FLT_MIN,
+        FLT_MIN,
+    };
+
+    for (uint32_t i = 0; i < glyphRun.glyphCount; ++i)
+    {
+        const auto& glyphMetrics = glyphRunMetrics[i];
+        const auto glyphAdvance = glyphRun.glyphAdvances ? glyphRun.glyphAdvances[i] : glyphMetrics.advanceWidth * fontScale;
+
+        const auto left = static_cast<float>(glyphMetrics.leftSideBearing) * fontScale;
+        const auto top = static_cast<float>(glyphMetrics.topSideBearing - glyphMetrics.verticalOriginY) * fontScale;
+        const auto right = static_cast<float>(gsl::narrow_cast<INT32>(glyphMetrics.advanceWidth) - glyphMetrics.rightSideBearing) * fontScale;
+        const auto bottom = static_cast<float>(gsl::narrow_cast<INT32>(glyphMetrics.advanceHeight) - glyphMetrics.bottomSideBearing - glyphMetrics.verticalOriginY) * fontScale;
+
+        if (left < right && top < bottom)
+        {
+            auto glyphX = baselineX;
+            auto glyphY = baselineY;
+            if (glyphRun.glyphOffsets)
+            {
+                glyphX += glyphRun.glyphOffsets[i].advanceOffset;
+                glyphY -= glyphRun.glyphOffsets[i].ascenderOffset;
+            }
+
+            accumulatedBounds.left = std::min(accumulatedBounds.left, left + glyphX);
+            accumulatedBounds.top = std::min(accumulatedBounds.top, top + glyphY);
+            accumulatedBounds.right = std::max(accumulatedBounds.right, right + glyphX);
+            accumulatedBounds.bottom = std::max(accumulatedBounds.bottom, bottom + glyphY);
+        }
+
+        baselineX += glyphAdvance;
+    }
+
+    return accumulatedBounds;
+}
 
 #pragma region IRenderEngine
 
@@ -81,48 +139,500 @@ try
     // > Note that this requirement includes the first frame the app renders with the swap chain.
     assert(debugGeneralPerformance || _r.frameLatencyWaitableObjectUsed);
 
-    if (_r.d2dMode) [[unlikely]]
+    if (_r.d2dMode)
     {
-        _d2dPresent();
+        if (!_r.d2dRenderTarget)
+        {
+            {
+                wil::com_ptr<ID3D11Texture2D> buffer;
+                THROW_IF_FAILED(_r.swapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), buffer.put_void()));
+
+                const auto surface = buffer.query<IDXGISurface>();
+
+                D2D1_RENDER_TARGET_PROPERTIES props{};
+                props.type = D2D1_RENDER_TARGET_TYPE_DEFAULT;
+                props.pixelFormat = { DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED };
+                props.dpiX = static_cast<float>(_r.dpi);
+                props.dpiY = static_cast<float>(_r.dpi);
+                wil::com_ptr<ID2D1RenderTarget> renderTarget;
+                THROW_IF_FAILED(_sr.d2dFactory->CreateDxgiSurfaceRenderTarget(surface.get(), &props, renderTarget.addressof()));
+                _r.d2dRenderTarget = renderTarget.query<ID2D1DeviceContext>();
+                _r.d2dRenderTarget4 = renderTarget.query<ID2D1DeviceContext4>();
+
+                // In case _api.realizedAntialiasingMode is D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE we'll
+                // continuously adjust it in AtlasEngine::_drawGlyph. See _drawGlyph.
+                _r.d2dRenderTarget->SetTextAntialiasMode(static_cast<D2D1_TEXT_ANTIALIAS_MODE>(_api.realizedAntialiasingMode));
+            }
+            {
+                static constexpr D2D1_COLOR_F color{ 1, 1, 1, 1 };
+                THROW_IF_FAILED(_r.d2dRenderTarget->CreateSolidColorBrush(&color, nullptr, _r.brush.put()));
+                _r.brushColor = 0xffffffff;
+            }
+            {
+                D2D1_BITMAP_PROPERTIES props{};
+                props.pixelFormat = { DXGI_FORMAT_R8G8B8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED };
+                props.dpiX = static_cast<float>(_r.dpi);
+                props.dpiY = static_cast<float>(_r.dpi);
+                THROW_IF_FAILED(_r.d2dRenderTarget->CreateBitmap({ _r.cellCount.x, _r.cellCount.y }, props, _r.d2dBackgroundBitmap.put()));
+                THROW_IF_FAILED(_r.d2dRenderTarget->CreateBitmapBrush(_r.d2dBackgroundBitmap.get(), _r.d2dBackgroundBrush.put()));
+                _r.d2dBackgroundBrush->SetInterpolationMode(D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR);
+                _r.d2dBackgroundBrush->SetTransform(D2D1::Matrix3x2F::Scale(_r.fontMetrics.cellSize.x, _r.fontMetrics.cellSize.y));
+            }
+        }
+
+        _r.d2dRenderTarget->BeginDraw();
+
+        _r.d2dBackgroundBitmap->CopyFromMemory(nullptr, _r.backgroundBitmap.data(), _r.cellCount.x * 4);
+        _r.d2dRenderTarget->FillRectangle({ 0, 0, _r.cellCount.x * _r.cellSizeDIP.x, _r.cellCount.y * _r.cellSizeDIP.y }, _r.d2dBackgroundBrush.get());
+
+        size_t y = 0;
+        for (const auto& row : _r.rows)
+        {
+            for (const auto& m : row.mappings)
+            {
+                DWRITE_GLYPH_RUN glyphRun{};
+                glyphRun.fontFace = m.fontFace.get();
+                glyphRun.fontEmSize = m.fontEmSize;
+                glyphRun.glyphCount = m.glyphsTo - m.glyphsFrom;
+                glyphRun.glyphIndices = &row.glyphIndices[m.glyphsFrom];
+                glyphRun.glyphAdvances = &row.glyphAdvances[m.glyphsFrom];
+                glyphRun.glyphOffsets = &row.glyphOffsets[m.glyphsFrom];
+
+                const D2D1_POINT_2F baseline{
+                    0, // TODO
+                    _r.cellSizeDIP.y * y + _r.fontMetrics.baselineInDIP,
+                };
+
+                _drawGlyphRun(baseline, &glyphRun, _r.brush.get());
+            }
+
+            y++;
+        }
+
+        THROW_IF_FAILED(_r.d2dRenderTarget->EndDraw());
     }
     else
     {
-        _adjustAtlasSize();
-        _processGlyphQueue();
+        if (!_r.atlasBuffer)
+        {
+            {
+                D3D11_TEXTURE2D_DESC desc{};
+                desc.Width = 1024;
+                desc.Height = 1024;
+                desc.MipLevels = 1;
+                desc.ArraySize = 1;
+                desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+                desc.SampleDesc = { 1, 0 };
+                desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+                THROW_IF_FAILED(_r.device->CreateTexture2D(&desc, nullptr, _r.atlasBuffer.addressof()));
+                THROW_IF_FAILED(_r.device->CreateShaderResourceView(_r.atlasBuffer.get(), nullptr, _r.atlasView.addressof()));
+            }
 
-        // The values the constant buffer depends on are potentially updated after BeginPaint().
+            {
+                _r.glyphCache.Clear();
+                _r.rectPackerData.resize(1024);
+                stbrp_init_target(&_r.rectPacker, 1024, 1024, _r.rectPackerData.data(), gsl::narrow_cast<int>(_r.rectPackerData.size()));
+            }
+
+            {
+                const auto surface = _r.atlasBuffer.query<IDXGISurface>();
+
+                wil::com_ptr<IDWriteRenderingParams1> renderingParams;
+                DWrite_GetRenderParams(_sr.dwriteFactory.get(), &_r.gamma, &_r.cleartypeEnhancedContrast, &_r.grayscaleEnhancedContrast, renderingParams.addressof());
+
+                D2D1_RENDER_TARGET_PROPERTIES props{};
+                props.type = D2D1_RENDER_TARGET_TYPE_DEFAULT;
+                props.pixelFormat = { DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED };
+                props.dpiX = static_cast<float>(_r.dpi);
+                props.dpiY = static_cast<float>(_r.dpi);
+                wil::com_ptr<ID2D1RenderTarget> renderTarget;
+                THROW_IF_FAILED(_sr.d2dFactory->CreateDxgiSurfaceRenderTarget(surface.get(), &props, renderTarget.addressof()));
+                _r.d2dRenderTarget = renderTarget.query<ID2D1DeviceContext>();
+                _r.d2dRenderTarget4 = renderTarget.query<ID2D1DeviceContext4>();
+
+                // We don't really use D2D for anything except DWrite, but it
+                // can't hurt to ensure that everything it does is pixel aligned.
+                _r.d2dRenderTarget->SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
+                // In case _api.realizedAntialiasingMode is D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE we'll
+                // continuously adjust it in AtlasEngine::_drawGlyph. See _drawGlyph.
+                _r.d2dRenderTarget->SetTextAntialiasMode(static_cast<D2D1_TEXT_ANTIALIAS_MODE>(_api.realizedAntialiasingMode));
+                // Ensure that D2D uses the exact same gamma as our shader uses.
+                _r.d2dRenderTarget->SetTextRenderingParams(renderingParams.get());
+            }
+            {
+                static constexpr D2D1_COLOR_F color{ 1, 1, 1, 1 };
+                THROW_IF_FAILED(_r.d2dRenderTarget->CreateSolidColorBrush(&color, nullptr, _r.brush.put()));
+                _r.brushColor = 0xffffffff;
+            }
+
+            switch (_api.realizedAntialiasingMode)
+            {
+            case D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE:
+                _r.textPixelShader = _r.cleartypePixelShader;
+                _r.textBlendState = _r.cleartypeBlendState;
+                break;
+            default:
+                _r.textPixelShader = _r.grayscalePixelShader;
+                _r.textBlendState = _r.alphaBlendState;
+                break;
+            }
+        }
+
+        vec2<size_t> textRange;
+        vec2<size_t> cursorRange;
+        vec2<size_t> selectionRange;
+
+        {
+            _r.vertexInstanceData.clear();
+
+            // Background
+            {
+                auto& ref = _r.vertexInstanceData.emplace_back();
+                ref.rect = { 0.0f, 0.0f, static_cast<f32>(_api.sizeInPixel.x), static_cast<f32>(_api.sizeInPixel.y) };
+                ref.tex = { 0.0f, 0.0f, static_cast<f32>(_api.sizeInPixel.x) / static_cast<f32>(_r.fontMetrics.cellSize.x), static_cast<f32>(_api.sizeInPixel.y) / static_cast<f32>(_r.fontMetrics.cellSize.y) };
+                ref.color = 0;
+                ref.shadingType = 1;
+            }
+
+            // Text
+            {
+                textRange.x = _r.vertexInstanceData.size();
+
+                {
+                    bool beganDrawing = false;
+
+                    size_t y = 0;
+                    for (const auto& row : _r.rows)
+                    {
+                        const auto baselineY = _r.cellSizeDIP.y * y + _r.fontMetrics.baselineInDIP;
+                        f32 cumulativeAdvance = 0;
+
+                        for (const auto& m : row.mappings)
+                        {
+                            for (auto i = m.glyphsFrom; i < m.glyphsTo; ++i)
+                            {
+                                bool inserted = false;
+                                auto& entry = _r.glyphCache.FindOrInsert(m.fontFace.get(), row.glyphIndices[i], inserted);
+                                if (inserted)
+                                {
+                                    if (!beganDrawing)
+                                    {
+                                        beganDrawing = true;
+                                        _r.d2dRenderTarget->BeginDraw();
+                                    }
+
+                                    _drawGlyph(entry, m.fontEmSize);
+                                }
+
+                                if (entry.wh != u16x2{})
+                                {
+                                    auto& ref = _r.vertexInstanceData.emplace_back();
+                                    ref.rect = {
+                                        (cumulativeAdvance + row.glyphOffsets[i].advanceOffset) * _r.pixelPerDIP + entry.offset.x,
+                                        (baselineY - row.glyphOffsets[i].ascenderOffset) * _r.pixelPerDIP + entry.offset.y,
+                                        static_cast<f32>(entry.wh.x),
+                                        static_cast<f32>(entry.wh.y),
+                                    };
+                                    ref.tex = {
+                                        static_cast<f32>(entry.xy.x),
+                                        static_cast<f32>(entry.xy.y),
+                                        static_cast<f32>(entry.wh.x),
+                                        static_cast<f32>(entry.wh.y),
+                                    };
+                                    ref.color = row.colors[i];
+                                    ref.shadingType = entry.colorGlyph ? 1 : 0;
+                                }
+
+                                cumulativeAdvance += row.glyphAdvances[i];
+                            }
+                        }
+
+                        y++;
+                    }
+
+                    if (beganDrawing)
+                    {
+                        THROW_IF_FAILED(_r.d2dRenderTarget->EndDraw());
+                    }
+                }
+
+                {
+                    auto it = _r.metadata.begin();
+
+                    for (u16 y = 0; y < _r.cellCount.y; ++y)
+                    {
+                        for (u16 x = 0; x < _r.cellCount.x; ++x, ++it)
+                        {
+                            const auto meta = *it;
+                            const auto flags = meta.flags;
+                            if (flags == CellFlags::None)
+                            {
+                                continue;
+                            }
+
+                            const auto top = _r.fontMetrics.cellSize.y * y;
+                            const auto left = _r.fontMetrics.cellSize.x * x;
+
+                            auto& ref = _r.vertexInstanceData.emplace_back();
+                            ref.color = meta.colors.x;
+                            ref.shadingType = 2;
+
+                            if (WI_IsFlagSet(flags, CellFlags::BorderLeft))
+                            {
+                                ref.rect = {
+                                    static_cast<float>(left),
+                                    static_cast<float>(top),
+                                    static_cast<float>(_r.fontMetrics.thinLineWidth),
+                                    static_cast<float>(_r.fontMetrics.cellSize.y),
+                                };
+                            }
+                            if (WI_IsFlagSet(flags, CellFlags::BorderTop))
+                            {
+                                ref.rect = {
+                                    static_cast<float>(left),
+                                    static_cast<float>(top),
+                                    static_cast<float>(_r.fontMetrics.cellSize.x),
+                                    static_cast<float>(_r.fontMetrics.thinLineWidth),
+                                };
+                            }
+                            if (WI_IsFlagSet(flags, CellFlags::BorderRight))
+                            {
+                                ref.rect = {
+                                    static_cast<float>(left + _r.fontMetrics.cellSize.x - _r.fontMetrics.thinLineWidth),
+                                    static_cast<float>(top),
+                                    static_cast<float>(_r.fontMetrics.thinLineWidth),
+                                    static_cast<float>(_r.fontMetrics.cellSize.y),
+                                };
+                            }
+                            if (WI_IsFlagSet(flags, CellFlags::BorderBottom))
+                            {
+                                ref.rect = {
+                                    static_cast<float>(left),
+                                    static_cast<float>(top + _r.fontMetrics.cellSize.y - _r.fontMetrics.thinLineWidth),
+                                    static_cast<float>(_r.fontMetrics.cellSize.x),
+                                    static_cast<float>(_r.fontMetrics.thinLineWidth),
+                                };
+                            }
+                            if (WI_IsFlagSet(flags, CellFlags::Underline))
+                            {
+                                ref.rect = {
+                                    static_cast<float>(left),
+                                    static_cast<float>(top + _r.fontMetrics.underlinePos),
+                                    static_cast<float>(_r.fontMetrics.cellSize.x),
+                                    static_cast<float>(_r.fontMetrics.underlineWidth),
+                                };
+                            }
+                            if (WI_IsFlagSet(flags, CellFlags::UnderlineDotted))
+                            {
+                                // TODO
+                                ref.rect = {
+                                    static_cast<float>(left),
+                                    static_cast<float>(top + _r.fontMetrics.underlinePos),
+                                    static_cast<float>(_r.fontMetrics.cellSize.x),
+                                    static_cast<float>(_r.fontMetrics.underlineWidth),
+                                };
+                            }
+                            if (WI_IsFlagSet(flags, CellFlags::UnderlineDouble))
+                            {
+                                ref.rect = {
+                                    static_cast<float>(left),
+                                    static_cast<float>(top + _r.fontMetrics.doubleUnderlinePos.x),
+                                    static_cast<float>(_r.fontMetrics.cellSize.x),
+                                    static_cast<float>(_r.fontMetrics.thinLineWidth),
+                                };
+                                auto& ref2 = _r.vertexInstanceData.emplace_back();
+                                ref2.color = meta.colors.x;
+                                ref2.shadingType = 2;
+                                ref2.rect = {
+                                    static_cast<float>(left),
+                                    static_cast<float>(top + _r.fontMetrics.doubleUnderlinePos.y),
+                                    static_cast<float>(_r.fontMetrics.cellSize.x),
+                                    static_cast<float>(_r.fontMetrics.thinLineWidth),
+                                };
+                            }
+                            if (WI_IsFlagSet(flags, CellFlags::Strikethrough))
+                            {
+                                ref.rect = {
+                                    static_cast<float>(left),
+                                    static_cast<float>(top + _r.fontMetrics.strikethroughPos),
+                                    static_cast<float>(_r.fontMetrics.cellSize.x),
+                                    static_cast<float>(_r.fontMetrics.strikethroughWidth),
+                                };
+                            }
+                        }
+                    }
+                }
+
+                textRange.y = _r.vertexInstanceData.size() - textRange.x;
+            }
+
+            if (_r.cursorRect.non_empty())
+            {
+                cursorRange.x = _r.vertexInstanceData.size();
+
+                auto& ref = _r.vertexInstanceData.emplace_back();
+                ref.rect = {
+                    static_cast<f32>(_r.fontMetrics.cellSize.x * _r.cursorRect.left),
+                    static_cast<f32>(_r.fontMetrics.cellSize.y * _r.cursorRect.top),
+                    static_cast<f32>(_r.fontMetrics.cellSize.x * (_r.cursorRect.right - _r.cursorRect.left)),
+                    static_cast<f32>(_r.fontMetrics.cellSize.y * (_r.cursorRect.bottom - _r.cursorRect.top)),
+                };
+
+                cursorRange.y = _r.vertexInstanceData.size() - cursorRange.x;
+            }
+
+            // Selection
+            {
+                selectionRange.x = _r.vertexInstanceData.size();
+
+                size_t y = 0;
+                for (const auto& row : _r.rows)
+                {
+                    if (row.selectionTo > row.selectionFrom)
+                    {
+                        auto& ref = _r.vertexInstanceData.emplace_back();
+                        ref.rect = {
+                            static_cast<f32>(_r.fontMetrics.cellSize.x * row.selectionFrom),
+                            static_cast<f32>(_r.fontMetrics.cellSize.y * y),
+                            static_cast<f32>(_r.fontMetrics.cellSize.x * (row.selectionTo - row.selectionFrom)),
+                            static_cast<f32>(_r.fontMetrics.cellSize.y),
+                        };
+                        ref.color = _r.selectionColor;
+                        ref.shadingType = 2;
+                    }
+
+                    y++;
+                }
+
+                selectionRange.y = _r.vertexInstanceData.size() - selectionRange.x;
+            }
+        }
+
         if (WI_IsFlagSet(_r.invalidations, RenderInvalidations::ConstBuffer))
         {
-            _updateConstantBuffer();
+            ConstBuffer data;
+            data.positionScale = { 2.0f / _api.sizeInPixel.x, -2.0f / _api.sizeInPixel.y, 1, 1 };
+            DWrite_GetGammaRatios(_r.gamma, data.gammaRatios);
+            data.cleartypeEnhancedContrast = _r.cleartypeEnhancedContrast;
+            data.grayscaleEnhancedContrast = _r.grayscaleEnhancedContrast;
+#pragma warning(suppress : 26447) // The function is declared 'noexcept' but calls function '...' which may throw exceptions (f.6).
+            _r.deviceContext->UpdateSubresource(_r.constantBuffer.get(), 0, nullptr, &data, 0, 0);
             WI_ClearFlag(_r.invalidations, RenderInvalidations::ConstBuffer);
+        }
+
+        if (_r.vertexInstanceData.size() > _r.vertexBuffers1Size)
+        {
+            const auto totalCellCount = static_cast<size_t>(_r.cellCount.x) * static_cast<size_t>(_r.cellCount.y);
+            const auto growthSize = _r.vertexBuffers1Size + _r.vertexBuffers1Size / 2;
+            const auto newSize = std::max(totalCellCount, growthSize);
+
+            D3D11_BUFFER_DESC desc{};
+            desc.ByteWidth = gsl::narrow<UINT>(sizeof(VertexInstanceData) * newSize);
+            desc.Usage = D3D11_USAGE_DYNAMIC;
+            desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+            desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+            THROW_IF_FAILED(_r.device->CreateBuffer(&desc, nullptr, _r.vertexBuffers[1].put()));
+
+            _r.vertexBuffers1Size = newSize;
         }
 
         {
 #pragma warning(suppress : 26494) // Variable 'mapped' is uninitialized. Always initialize an object (type.5).
             D3D11_MAPPED_SUBRESOURCE mapped;
-            THROW_IF_FAILED(_r.deviceContext->Map(_r.cellBuffer.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped));
-            assert(mapped.RowPitch >= _r.cells.size() * sizeof(Cell));
-            memcpy(mapped.pData, _r.cells.data(), _r.cells.size() * sizeof(Cell));
-            _r.deviceContext->Unmap(_r.cellBuffer.get(), 0);
+            THROW_IF_FAILED(_r.deviceContext->Map(_r.perCellColor.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped));
+            for (auto i = 0; i < _r.cellCount.y; ++i)
+            {
+                memcpy(mapped.pData, _r.backgroundBitmap.data() + i * _r.cellCount.x, _r.cellCount.x * sizeof(u32));
+                mapped.pData = static_cast<void*>(static_cast<std::byte*>(mapped.pData) + mapped.RowPitch);
+            }
+            _r.deviceContext->Unmap(_r.perCellColor.get(), 0);
         }
 
-        if (_r.customPixelShader) [[unlikely]]
         {
-            _renderWithCustomShader();
+#pragma warning(suppress : 26494) // Variable 'mapped' is uninitialized. Always initialize an object (type.5).
+            D3D11_MAPPED_SUBRESOURCE mapped;
+            THROW_IF_FAILED(_r.deviceContext->Map(_r.vertexBuffers[1].get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped));
+            memcpy(mapped.pData, _r.vertexInstanceData.data(), _r.vertexInstanceData.size() * sizeof(VertexInstanceData));
+            _r.deviceContext->Unmap(_r.vertexBuffers[1].get(), 0);
         }
-        else
+
         {
-            _r.deviceContext->OMSetRenderTargets(1, _r.renderTargetView.addressof(), nullptr);
-            _r.deviceContext->Draw(3, 0);
+            {
+                // IA: Input Assembler
+                static constexpr UINT strides[2]{ sizeof(f32x2), sizeof(VertexInstanceData) };
+                static constexpr UINT offsets[2]{ 0, 0 };
+                _r.deviceContext->IASetInputLayout(_r.textInputLayout.get());
+                _r.deviceContext->IASetVertexBuffers(0, 2, _r.vertexBuffers[0].addressof(), &strides[0], &offsets[0]);
+                _r.deviceContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+                // VS: Vertex Shader
+                _r.deviceContext->VSSetShader(_r.vertexShader.get(), nullptr, 0);
+                _r.deviceContext->VSSetConstantBuffers(0, 1, _r.constantBuffer.addressof());
+
+                // RS: Rasterizer Stage
+                D3D11_VIEWPORT viewport{};
+                viewport.Width = static_cast<float>(_api.sizeInPixel.x);
+                viewport.Height = static_cast<float>(_api.sizeInPixel.y);
+                _r.deviceContext->RSSetViewports(1, &viewport);
+                _r.deviceContext->RSSetState(_r.rasterizerState.get());
+
+                // PS: Pixel Shader
+                _r.deviceContext->PSSetShader(_r.textPixelShader.get(), nullptr, 0);
+                _r.deviceContext->PSSetConstantBuffers(0, 1, _r.constantBuffer.addressof());
+                _r.deviceContext->PSSetShaderResources(0, 1, _r.perCellColorView.addressof());
+
+                // OM: Output Merger
+                _r.deviceContext->OMSetRenderTargets(1, _r.renderTargetView.addressof(), nullptr);
+                _r.deviceContext->OMSetBlendState(nullptr, nullptr, 0xffffffff);
+
+                _r.deviceContext->DrawInstanced(6, 1, 0, 0);
+            }
+
+            // Inverted cursors use D3D11 Logic Ops with D3D11_LOGIC_OP_XOR (see GH#).
+            // But unfortunately this poses two problems:
+            // * Cursors are drawn "in between" text and selection
+            // * all RenderTargets bound must have a UINT format
+            // --> We have to draw in 3 passes.
+            if (cursorRange.y)
+            {
+                _r.deviceContext->PSSetShader(_r.textPixelShader.get(), nullptr, 0);
+                _r.deviceContext->PSSetShaderResources(0, 1, _r.atlasView.addressof());
+                _r.deviceContext->OMSetBlendState(_r.textBlendState.get(), nullptr, 0xffffffff);
+                _r.deviceContext->DrawInstanced(_r.instanceCount, gsl::narrow_cast<UINT>(textRange.y), 0, gsl::narrow_cast<UINT>(textRange.x));
+
+                _r.deviceContext->PSSetShader(_r.invertCursorPixelShader.get(), nullptr, 0);
+                _r.deviceContext->OMSetRenderTargets(1, _r.renderTargetViewUInt.addressof(), nullptr);
+                _r.deviceContext->OMSetBlendState(_r.invertCursorBlendState.get(), nullptr, 0xffffffff);
+                _r.deviceContext->DrawInstanced(_r.instanceCount, gsl::narrow_cast<UINT>(cursorRange.y), 0, gsl::narrow_cast<UINT>(cursorRange.x));
+
+                if (selectionRange.y)
+                {
+                    _r.deviceContext->PSSetShader(_r.textPixelShader.get(), nullptr, 0);
+                    _r.deviceContext->PSSetShaderResources(0, 1, _r.atlasView.addressof());
+                    _r.deviceContext->OMSetRenderTargets(1, _r.renderTargetView.addressof(), nullptr);
+                    _r.deviceContext->OMSetBlendState(_r.textBlendState.get(), nullptr, 0xffffffff);
+                    _r.deviceContext->DrawInstanced(_r.instanceCount, gsl::narrow_cast<UINT>(selectionRange.y), 0, gsl::narrow_cast<UINT>(selectionRange.x));
+                }
+            }
+            else
+            {
+                _r.deviceContext->PSSetShader(_r.textPixelShader.get(), nullptr, 0);
+                _r.deviceContext->PSSetShaderResources(0, 1, _r.atlasView.addressof());
+                _r.deviceContext->OMSetBlendState(_r.textBlendState.get(), nullptr, 0xffffffff);
+                _r.deviceContext->DrawInstanced(_r.instanceCount, gsl::narrow_cast<UINT>(textRange.y + selectionRange.y), 0, gsl::narrow_cast<UINT>(textRange.x));
+            }
+        }
+
+        if constexpr (false)
+        {
+            _r.deviceContext->RSSetState(_r.wireframeRasterizerState.get());
+            _r.deviceContext->PSSetShader(_r.wireframePixelShader.get(), nullptr, 0);
+            _r.deviceContext->OMSetBlendState(_r.alphaBlendState.get(), nullptr, 0xffffffff);
+            _r.deviceContext->DrawInstanced(_r.instanceCount, gsl::narrow<UINT>(_r.vertexInstanceData.size()), 0, 0);
         }
     }
 
-    // See documentation for IDXGISwapChain2::GetFrameLatencyWaitableObject method:
-    // > For every frame it renders, the app should wait on this handle before starting any rendering operations.
-    // > Note that this requirement includes the first frame the app renders with the swap chain.
-    assert(debugGeneralPerformance || _r.frameLatencyWaitableObjectUsed);
-
-    if (_r.dirtyRect != fullRect)
+    if (false && _r.dirtyRect != fullRect)
     {
         auto dirtyRectInPx = _r.dirtyRect;
         dirtyRectInPx.left *= _r.fontMetrics.cellSize.x;
@@ -193,7 +703,7 @@ void AtlasEngine::WaitUntilCanRender() noexcept
     // IDXGISwapChain2::GetFrameLatencyWaitableObject returns an auto-reset event.
     // Once we've waited on the event, waiting on it again will block until the timeout elapses.
     // _r.waitForPresentation guards against this.
-    if (!debugGeneralPerformance && std::exchange(_r.waitForPresentation, false))
+    if (std::exchange(_r.waitForPresentation, false))
     {
         WaitForSingleObjectEx(_r.frameLatencyWaitableObject.get(), 100, true);
 #ifndef NDEBUG
@@ -204,903 +714,144 @@ void AtlasEngine::WaitUntilCanRender() noexcept
 
 #pragma endregion
 
-void AtlasEngine::_renderWithCustomShader() const
+bool AtlasEngine::_drawGlyphRun(D2D_POINT_2F baselineOrigin, const DWRITE_GLYPH_RUN* glyphRun, ID2D1SolidColorBrush* foregroundBrush) const noexcept
 {
-    // Render with our main shader just like Present().
+    static constexpr auto measuringMode = DWRITE_MEASURING_MODE_NATURAL;
+    static constexpr auto formats =
+        DWRITE_GLYPH_IMAGE_FORMATS_TRUETYPE |
+        DWRITE_GLYPH_IMAGE_FORMATS_CFF |
+        DWRITE_GLYPH_IMAGE_FORMATS_COLR |
+        DWRITE_GLYPH_IMAGE_FORMATS_SVG |
+        DWRITE_GLYPH_IMAGE_FORMATS_PNG |
+        DWRITE_GLYPH_IMAGE_FORMATS_JPEG |
+        DWRITE_GLYPH_IMAGE_FORMATS_TIFF |
+        DWRITE_GLYPH_IMAGE_FORMATS_PREMULTIPLIED_B8G8R8A8;
+
+    wil::com_ptr<IDWriteColorGlyphRunEnumerator1> enumerator;
+
+    // If ID2D1DeviceContext4 isn't supported, we'll exit early below.
+    auto hr = DWRITE_E_NOCOLOR;
+
+    if (_r.d2dRenderTarget4)
     {
-        // OM: Output Merger
-        _r.deviceContext->OMSetRenderTargets(1, _r.customOffscreenTextureTargetView.addressof(), nullptr);
-        _r.deviceContext->Draw(3, 0);
+        D2D_MATRIX_3X2_F transform;
+        _r.d2dRenderTarget4->GetTransform(&transform);
+        float dpiX, dpiY;
+        _r.d2dRenderTarget4->GetDpi(&dpiX, &dpiY);
+        transform = transform * D2D1::Matrix3x2F::Scale(dpiX, dpiY);
+
+        // Support for ID2D1DeviceContext4 implies support for IDWriteFactory4.
+        // ID2D1DeviceContext4 is required for drawing below.
+        hr = _sr.dwriteFactory4->TranslateColorGlyphRun(baselineOrigin, glyphRun, nullptr, formats, measuringMode, nullptr, 0, &enumerator);
     }
 
-    // Update the custom shader's constant buffer.
+    if (hr == DWRITE_E_NOCOLOR)
     {
-        CustomConstBuffer data;
-        data.time = std::chrono::duration<float>(std::chrono::steady_clock::now() - _r.customShaderStartTime).count();
-        data.scale = _r.pixelPerDIP;
-        data.resolution.x = static_cast<float>(_r.cellCount.x * _r.fontMetrics.cellSize.x);
-        data.resolution.y = static_cast<float>(_r.cellCount.y * _r.fontMetrics.cellSize.y);
-        data.background = colorFromU32<f32x4>(_r.backgroundColor);
-
-#pragma warning(suppress : 26494) // Variable 'mapped' is uninitialized. Always initialize an object (type.5).
-        D3D11_MAPPED_SUBRESOURCE mapped;
-        THROW_IF_FAILED(_r.deviceContext->Map(_r.customShaderConstantBuffer.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped));
-        assert(mapped.RowPitch >= sizeof(data));
-        memcpy(mapped.pData, &data, sizeof(data));
-        _r.deviceContext->Unmap(_r.customShaderConstantBuffer.get(), 0);
+        _r.d2dRenderTarget->DrawGlyphRun(baselineOrigin, glyphRun, foregroundBrush, measuringMode);
+        return false;
     }
 
-    // Render with the custom shader.
+    THROW_IF_FAILED(hr);
+
+    const auto previousAntialiasingMode = _r.d2dRenderTarget4->GetTextAntialiasMode();
+    _r.d2dRenderTarget4->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+    const auto cleanup = wil::scope_exit([&]() {
+        _r.d2dRenderTarget4->SetTextAntialiasMode(previousAntialiasingMode);
+    });
+
+    wil::com_ptr<ID2D1SolidColorBrush> solidBrush;
+
+    for (;;)
     {
-        // OM: Output Merger
-        // customOffscreenTextureView was just rendered to via customOffscreenTextureTargetView and is
-        // set as the output target. Before we can use it as an input we have to remove it as an output.
-        _r.deviceContext->OMSetRenderTargets(1, _r.renderTargetView.addressof(), nullptr);
+        BOOL hasRun;
+        THROW_IF_FAILED(enumerator->MoveNext(&hasRun));
+        if (!hasRun)
+        {
+            break;
+        }
 
-        // VS: Vertex Shader
-        _r.deviceContext->VSSetShader(_r.customVertexShader.get(), nullptr, 0);
+        const DWRITE_COLOR_GLYPH_RUN1* colorGlyphRun;
+        THROW_IF_FAILED(enumerator->GetCurrentRun(&colorGlyphRun));
 
-        // PS: Pixel Shader
-        _r.deviceContext->PSSetShader(_r.customPixelShader.get(), nullptr, 0);
-        _r.deviceContext->PSSetConstantBuffers(0, 1, _r.customShaderConstantBuffer.addressof());
-        _r.deviceContext->PSSetShaderResources(0, 1, _r.customOffscreenTextureView.addressof());
-        _r.deviceContext->PSSetSamplers(0, 1, _r.customShaderSamplerState.addressof());
+        ID2D1Brush* runBrush;
+        if (colorGlyphRun->paletteIndex == /*DWRITE_NO_PALETTE_INDEX*/ 0xffff)
+        {
+            runBrush = foregroundBrush;
+        }
+        else
+        {
+            if (!solidBrush)
+            {
+                THROW_IF_FAILED(_r.d2dRenderTarget4->CreateSolidColorBrush(colorGlyphRun->runColor, &solidBrush));
+            }
+            else
+            {
+                solidBrush->SetColor(colorGlyphRun->runColor);
+            }
+            runBrush = solidBrush.get();
+        }
 
-        _r.deviceContext->Draw(4, 0);
+        switch (colorGlyphRun->glyphImageFormat)
+        {
+        case DWRITE_GLYPH_IMAGE_FORMATS_NONE:
+            break;
+        case DWRITE_GLYPH_IMAGE_FORMATS_PNG:
+        case DWRITE_GLYPH_IMAGE_FORMATS_JPEG:
+        case DWRITE_GLYPH_IMAGE_FORMATS_TIFF:
+        case DWRITE_GLYPH_IMAGE_FORMATS_PREMULTIPLIED_B8G8R8A8:
+            _r.d2dRenderTarget4->DrawColorBitmapGlyphRun(colorGlyphRun->glyphImageFormat, baselineOrigin, &colorGlyphRun->glyphRun, colorGlyphRun->measuringMode, D2D1_COLOR_BITMAP_GLYPH_SNAP_OPTION_DEFAULT);
+            break;
+        case DWRITE_GLYPH_IMAGE_FORMATS_SVG:
+            _r.d2dRenderTarget4->DrawSvgGlyphRun(baselineOrigin, &colorGlyphRun->glyphRun, runBrush, nullptr, 0, colorGlyphRun->measuringMode);
+            break;
+        default:
+            _r.d2dRenderTarget4->DrawGlyphRun(baselineOrigin, &colorGlyphRun->glyphRun, colorGlyphRun->glyphRunDescription, runBrush, colorGlyphRun->measuringMode);
+            break;
+        }
     }
 
-    // For the next frame we need to restore our context state.
-    {
-        // VS: Vertex Shader
-        _r.deviceContext->VSSetShader(_r.vertexShader.get(), nullptr, 0);
-
-        // PS: Pixel Shader
-        _r.deviceContext->PSSetShader(_r.pixelShader.get(), nullptr, 0);
-        _r.deviceContext->PSSetConstantBuffers(0, 1, _r.constantBuffer.addressof());
-        const std::array resources{ _r.cellView.get(), _r.atlasView.get() };
-        _r.deviceContext->PSSetShaderResources(0, gsl::narrow_cast<UINT>(resources.size()), resources.data());
-        _r.deviceContext->PSSetSamplers(0, 0, nullptr);
-    }
+    return true;
 }
 
-void AtlasEngine::_setShaderResources() const
+void AtlasEngine::_drawGlyph(GlyphCacheEntry& entry, f32 fontEmSize)
 {
-    // IA: Input Assembler
-    // Our vertex shader uses a trick from Bill Bilodeau published in
-    // "Vertex Shader Tricks" at GDC14 to draw a fullscreen triangle
-    // without vertex/index buffers. This prepares our context for this.
-    _r.deviceContext->IASetVertexBuffers(0, 0, nullptr, nullptr, nullptr);
-    _r.deviceContext->IASetIndexBuffer(nullptr, DXGI_FORMAT_UNKNOWN, 0);
-    _r.deviceContext->IASetInputLayout(nullptr);
-    _r.deviceContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+    DWRITE_GLYPH_RUN glyphRun{};
+    glyphRun.fontFace = entry.fontFace;
+    glyphRun.fontEmSize = fontEmSize;
+    glyphRun.glyphCount = 1;
+    glyphRun.glyphIndices = &entry.glyphIndex;
 
-    // VS: Vertex Shader
-    _r.deviceContext->VSSetShader(_r.vertexShader.get(), nullptr, 0);
-
-    // PS: Pixel Shader
-    _r.deviceContext->PSSetShader(_r.pixelShader.get(), nullptr, 0);
-    _r.deviceContext->PSSetConstantBuffers(0, 1, _r.constantBuffer.addressof());
-    const std::array resources{ _r.cellView.get(), _r.atlasView.get() };
-    _r.deviceContext->PSSetShaderResources(0, gsl::narrow_cast<UINT>(resources.size()), resources.data());
-}
-
-void AtlasEngine::_updateConstantBuffer() const noexcept
-{
-    const auto useClearType = _api.realizedAntialiasingMode == D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE;
-
-    ConstBuffer data;
-    data.viewport.x = 0;
-    data.viewport.y = 0;
-    data.viewport.z = static_cast<float>(_r.cellCount.x * _r.fontMetrics.cellSize.x);
-    data.viewport.w = static_cast<float>(_r.cellCount.y * _r.fontMetrics.cellSize.y);
-    DWrite_GetGammaRatios(_r.gamma, data.gammaRatios);
-    data.enhancedContrast = useClearType ? _r.cleartypeEnhancedContrast : _r.grayscaleEnhancedContrast;
-    data.cellCountX = _r.cellCount.x;
-    data.cellSize.x = _r.fontMetrics.cellSize.x;
-    data.cellSize.y = _r.fontMetrics.cellSize.y;
-    data.underlinePos = _r.fontMetrics.underlinePos;
-    data.underlineWidth = _r.fontMetrics.underlineWidth;
-    data.strikethroughPos = _r.fontMetrics.strikethroughPos;
-    data.strikethroughWidth = _r.fontMetrics.strikethroughWidth;
-    data.doubleUnderlinePos.x = _r.fontMetrics.doubleUnderlinePos.x;
-    data.doubleUnderlinePos.y = _r.fontMetrics.doubleUnderlinePos.y;
-    data.thinLineWidth = _r.fontMetrics.thinLineWidth;
-    data.backgroundColor = _r.backgroundColor;
-    data.cursorColor = _r.cursorOptions.cursorColor;
-    data.selectionColor = _r.selectionColor;
-    data.useClearType = useClearType;
-#pragma warning(suppress : 26447) // The function is declared 'noexcept' but calls function '...' which may throw exceptions (f.6).
-    _r.deviceContext->UpdateSubresource(_r.constantBuffer.get(), 0, nullptr, &data, 0, 0);
-}
-
-void AtlasEngine::_adjustAtlasSize()
-{
-    // Only grow the atlas texture if our tileAllocator needs it to be larger.
-    // We have no way of shrinking our tileAllocator at the moment,
-    // so technically a `requiredSize != _r.atlasSizeInPixel`
-    // comparison would be sufficient, but better safe than sorry.
-    const auto requiredSize = _r.tileAllocator.size();
-    if (requiredSize.y <= _r.atlasSizeInPixel.y && requiredSize.x <= _r.atlasSizeInPixel.x)
+    auto box = getGlyphRunBlackBox(glyphRun, 0, 0);
+    if (box.left >= box.right || box.top >= box.bottom)
     {
         return;
     }
 
-    wil::com_ptr<ID3D11Texture2D> atlasBuffer;
-    wil::com_ptr<ID3D11ShaderResourceView> atlasView;
+    box.left = roundf(box.left * _r.pixelPerDIP) - 1.0f;
+    box.top = roundf(box.top * _r.pixelPerDIP) - 1.0f;
+    box.right = roundf(box.right * _r.pixelPerDIP) + 1.0f;
+    box.bottom = roundf(box.bottom * _r.pixelPerDIP) + 1.0f;
+
+    stbrp_rect rect{};
+    rect.w = gsl::narrow_cast<int>(box.right - box.left);
+    rect.h = gsl::narrow_cast<int>(box.bottom - box.top);
+    if (!stbrp_pack_rects(&_r.rectPacker, &rect, 1))
     {
-        D3D11_TEXTURE2D_DESC desc{};
-        desc.Width = requiredSize.x;
-        desc.Height = requiredSize.y;
-        desc.MipLevels = 1;
-        desc.ArraySize = 1;
-        desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-        desc.SampleDesc = { 1, 0 };
-        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
-        THROW_IF_FAILED(_r.device->CreateTexture2D(&desc, nullptr, atlasBuffer.addressof()));
-        THROW_IF_FAILED(_r.device->CreateShaderResourceView(atlasBuffer.get(), nullptr, atlasView.addressof()));
-    }
-
-    // If a _r.atlasBuffer already existed, we can copy its glyphs
-    // over to the new texture without re-rendering everything.
-    const auto copyFromExisting = _r.atlasSizeInPixel != u16x2{};
-    if (copyFromExisting)
-    {
-        D3D11_BOX box;
-        box.left = 0;
-        box.top = 0;
-        box.front = 0;
-        box.right = _r.atlasSizeInPixel.x;
-        box.bottom = _r.atlasSizeInPixel.y;
-        box.back = 1;
-        _r.deviceContext->CopySubresourceRegion1(atlasBuffer.get(), 0, 0, 0, 0, _r.atlasBuffer.get(), 0, &box, D3D11_COPY_NO_OVERWRITE);
-    }
-
-    {
-        const auto surface = atlasBuffer.query<IDXGISurface>();
-
-        wil::com_ptr<IDWriteRenderingParams1> renderingParams;
-        DWrite_GetRenderParams(_sr.dwriteFactory.get(), &_r.gamma, &_r.cleartypeEnhancedContrast, &_r.grayscaleEnhancedContrast, renderingParams.addressof());
-
-        D2D1_RENDER_TARGET_PROPERTIES props{};
-        props.type = D2D1_RENDER_TARGET_TYPE_DEFAULT;
-        props.pixelFormat = { DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED };
-        props.dpiX = static_cast<float>(_r.dpi);
-        props.dpiY = static_cast<float>(_r.dpi);
-        wil::com_ptr<ID2D1RenderTarget> renderTarget;
-        THROW_IF_FAILED(_sr.d2dFactory->CreateDxgiSurfaceRenderTarget(surface.get(), &props, renderTarget.addressof()));
-        _r.d2dRenderTarget = renderTarget.query<ID2D1DeviceContext>();
-
-        // We don't really use D2D for anything except DWrite, but it
-        // can't hurt to ensure that everything it does is pixel aligned.
-        _r.d2dRenderTarget->SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
-        // In case _api.realizedAntialiasingMode is D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE we'll
-        // continuously adjust it in AtlasEngine::_drawGlyph. See _drawGlyph.
-        _r.d2dRenderTarget->SetTextAntialiasMode(static_cast<D2D1_TEXT_ANTIALIAS_MODE>(_api.realizedAntialiasingMode));
-        // Ensure that D2D uses the exact same gamma as our shader uses.
-        _r.d2dRenderTarget->SetTextRenderingParams(renderingParams.get());
-    }
-    {
-        static constexpr D2D1_COLOR_F color{ 1, 1, 1, 1 };
-        THROW_IF_FAILED(_r.d2dRenderTarget->CreateSolidColorBrush(&color, nullptr, _r.brush.put()));
-        _r.brushColor = 0xffffffff;
-    }
-
-    _r.atlasSizeInPixel = requiredSize;
-    _r.atlasBuffer = std::move(atlasBuffer);
-    _r.atlasView = std::move(atlasView);
-    _setShaderResources();
-
-    WI_SetAllFlags(_r.invalidations, RenderInvalidations::ConstBuffer);
-    WI_SetFlagIf(_r.invalidations, RenderInvalidations::Cursor, !copyFromExisting);
-}
-
-void AtlasEngine::_processGlyphQueue()
-{
-    if (_r.glyphQueue.empty() && WI_IsFlagClear(_r.invalidations, RenderInvalidations::Cursor))
-    {
+        __debugbreak();
         return;
     }
 
-    _r.d2dRenderTarget->BeginDraw();
-
-    if (WI_IsFlagSet(_r.invalidations, RenderInvalidations::Cursor))
-    {
-        _drawCursor({ 0, 0, 1, 1 }, 0xffffffff, true);
-        WI_ClearFlag(_r.invalidations, RenderInvalidations::Cursor);
-    }
-
-    for (const auto& it : _r.glyphQueue)
-    {
-        _drawGlyph(it);
-    }
-    _r.glyphQueue.clear();
-
-    THROW_IF_FAILED(_r.d2dRenderTarget->EndDraw());
-}
-
-void AtlasEngine::_drawGlyph(const TileHashMap::iterator& it) const
-{
-    const auto key = it->first.data();
-    const auto value = it->second.data();
-    const auto coords = &value->coords[0];
-    const auto charsLength = key->charCount;
-    const auto cellCount = key->attributes.cellCount;
-    const auto textFormat = _getTextFormat(key->attributes.bold, key->attributes.italic);
-    const auto coloredGlyph = WI_IsFlagSet(value->flags, CellFlags::ColoredGlyph);
-    const auto cachedLayout = _getCachedGlyphLayout(&key->chars[0], charsLength, cellCount, textFormat, coloredGlyph);
-
-    // Colored glyphs cannot be drawn in linear gamma.
-    // That's why we're simply alpha-blending them in the shader.
-    // In order for this to work correctly we have to prevent them from being drawn
-    // with ClearType, because we would then lack the alpha channel for the glyphs.
-    if (_api.realizedAntialiasingMode == D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE)
-    {
-        _r.d2dRenderTarget->SetTextAntialiasMode(coloredGlyph ? D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE : D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE);
-    }
-
-    for (u16 i = 0; i < cellCount; ++i)
-    {
-        const auto coord = coords[i];
-
-        D2D1_RECT_F rect;
-        rect.left = static_cast<float>(coord.x) * _r.dipPerPixel;
-        rect.top = static_cast<float>(coord.y) * _r.dipPerPixel;
-        rect.right = rect.left + _r.cellSizeDIP.x;
-        rect.bottom = rect.top + _r.cellSizeDIP.y;
-
-        D2D1_POINT_2F origin;
-        origin.x = rect.left - i * _r.cellSizeDIP.x;
-        origin.y = rect.top;
-
-        _r.d2dRenderTarget->PushAxisAlignedClip(&rect, D2D1_ANTIALIAS_MODE_ALIASED);
-        _r.d2dRenderTarget->Clear();
-
-        cachedLayout.applyScaling(_r.d2dRenderTarget.get(), origin);
-
-        // Now that we're done using origin to calculate the center point for our transformation
-        // we can use it for its intended purpose to slightly shift the glyph around.
-        origin.x += cachedLayout.offset.x;
-        origin.y += cachedLayout.offset.y;
-        _r.d2dRenderTarget->DrawTextLayout(origin, cachedLayout.textLayout.get(), _r.brush.get(), cachedLayout.options);
-
-        cachedLayout.undoScaling(_r.d2dRenderTarget.get());
-
-        _r.d2dRenderTarget->PopAxisAlignedClip();
-    }
-}
-
-AtlasEngine::CachedGlyphLayout AtlasEngine::_getCachedGlyphLayout(const wchar_t* chars, u16 charsLength, u16 cellCount, IDWriteTextFormat* textFormat, bool coloredGlyph) const
-{
-    const f32x2 layoutBox{ cellCount * _r.cellSizeDIP.x, _r.cellSizeDIP.y };
-    bool scalingRequired = false;
-    f32x2 offset{ 0, 0 };
-    f32x2 scale{ 1, 1 };
-    f32x2 scaleCenter;
-
-    // See D2DFactory::DrawText
-    wil::com_ptr<IDWriteTextLayout> textLayout;
-    THROW_IF_FAILED(_sr.dwriteFactory->CreateTextLayout(chars, charsLength, textFormat, layoutBox.x, layoutBox.y, textLayout.addressof()));
-    if (_r.typography)
-    {
-        textLayout->SetTypography(_r.typography.get(), { 0, charsLength });
-    }
-
-    // Block Element and Box Drawing characters need to be handled separately,
-    // because unlike regular ones they're supposed to fill the entire layout box.
-    //
-    // Ranges:
-    // * 0x2500-0x257F: Box Drawing
-    // * 0x2580-0x259F: Block Elements
-    // * 0xE0A0-0xE0A3,0xE0B0-0xE0C8,0xE0CA-0xE0CA,0xE0CC-0xE0D4: PowerLine
-    //   (https://github.com/ryanoasis/nerd-fonts/wiki/Glyph-Sets-and-Code-Points#powerline-symbols)
-    //
-    // The following `blockCharacters` forms a so called "inversion list".
-    static constexpr std::array blockCharacters{
-        // clang-format off
-        L'\u2500', L'\u2580',
-        L'\u2580', L'\u25A0',
-        L'\uE0A0', L'\uE0A4',
-        L'\uE0B0', L'\uE0C9',
-        L'\uE0CA', L'\uE0CB',
-        L'\uE0CC', L'\uE0D5',
-        // clang-format on
+    const D2D1_POINT_2F baseline{
+        (rect.x - box.left) * _r.dipPerPixel,
+        (rect.y - box.top) * _r.dipPerPixel,
     };
-
-    if (charsLength == 1 && isInInversionList(blockCharacters, chars[0]))
-    {
-        wil::com_ptr<IDWriteFontCollection> fontCollection;
-        THROW_IF_FAILED(textFormat->GetFontCollection(fontCollection.addressof()));
-        const auto baseWeight = textFormat->GetFontWeight();
-        const auto baseStyle = textFormat->GetFontStyle();
-
-        TextAnalysisSource analysisSource{ chars, 1 };
-        UINT32 mappedLength = 0;
-        wil::com_ptr<IDWriteFont> mappedFont;
-        FLOAT mappedScale = 0;
-        THROW_IF_FAILED(_sr.systemFontFallback->MapCharacters(
-            /* analysisSource     */ &analysisSource,
-            /* textPosition       */ 0,
-            /* textLength         */ 1,
-            /* baseFontCollection */ fontCollection.get(),
-            /* baseFamilyName     */ _r.fontMetrics.fontName.data(),
-            /* baseWeight         */ baseWeight,
-            /* baseStyle          */ baseStyle,
-            /* baseStretch        */ DWRITE_FONT_STRETCH_NORMAL,
-            /* mappedLength       */ &mappedLength,
-            /* mappedFont         */ mappedFont.addressof(),
-            /* scale              */ &mappedScale));
-
-        if (mappedFont)
-        {
-            wil::com_ptr<IDWriteFontFace> fontFace;
-            THROW_IF_FAILED(mappedFont->CreateFontFace(fontFace.addressof()));
-
-            // Don't adjust the size of block glyphs that are part of the user's chosen font.
-            if (std::ranges::find(_r.fontFaces, fontFace) == std::end(_r.fontFaces))
-            {
-                DWRITE_FONT_METRICS metrics;
-                fontFace->GetMetrics(&metrics);
-
-                static constexpr u32 codePoint = L'\u2588'; // Full Block character
-                u16 glyphIndex;
-                THROW_IF_FAILED(fontFace->GetGlyphIndicesW(&codePoint, 1, &glyphIndex));
-
-                if (glyphIndex)
-                {
-                    DWRITE_GLYPH_METRICS glyphMetrics;
-                    THROW_IF_FAILED(fontFace->GetDesignGlyphMetrics(&glyphIndex, 1, &glyphMetrics));
-
-                    const auto fontScale = _r.fontMetrics.fontSizeInDIP / metrics.designUnitsPerEm;
-
-                    // How-to-DWRITE_OVERHANG_METRICS given a single glyph:
-                    DWRITE_OVERHANG_METRICS overhang;
-                    overhang.left = static_cast<f32>(glyphMetrics.leftSideBearing) * fontScale;
-                    overhang.top = static_cast<f32>(glyphMetrics.verticalOriginY - glyphMetrics.topSideBearing) * fontScale - _r.fontMetrics.baselineInDIP;
-                    overhang.right = static_cast<f32>(gsl::narrow_cast<INT32>(glyphMetrics.advanceWidth) - glyphMetrics.rightSideBearing) * fontScale - layoutBox.x;
-                    overhang.bottom = static_cast<f32>(gsl::narrow_cast<INT32>(glyphMetrics.advanceHeight) - glyphMetrics.verticalOriginY - glyphMetrics.bottomSideBearing) * fontScale + _r.fontMetrics.baselineInDIP - layoutBox.y;
-
-                    scalingRequired = true;
-                    // Center glyphs.
-                    offset.x = (overhang.left - overhang.right) * 0.5f;
-                    offset.y = (overhang.top - overhang.bottom) * 0.5f;
-                    // We always want box drawing glyphs to exactly match the size of a terminal cell.
-                    // But add 1px to the destination size, so that we don't end up with fractional pixels.
-                    scale.x = (layoutBox.x + _r.pixelPerDIP) / (layoutBox.x + overhang.left + overhang.right);
-                    scale.y = (layoutBox.y + _r.pixelPerDIP) / (layoutBox.y + overhang.top + overhang.bottom);
-                    // Now that the glyph is in the center of the cell thanks
-                    // to the offset, the scaleCenter is center of the cell.
-                    scaleCenter.x = layoutBox.x * 0.5f;
-                    scaleCenter.y = layoutBox.y * 0.5f;
-                }
-            }
-        }
-    }
-    else
-    {
-        DWRITE_OVERHANG_METRICS overhang;
-        THROW_IF_FAILED(textLayout->GetOverhangMetrics(&overhang));
-
-        auto actualSizeX = layoutBox.x + overhang.left + overhang.right;
-
-        // Long glyphs should be drawn with their proper design size, even if that makes them a bit blurry,
-        // because otherwise we fail to support "pseudo" block characters like the "===" ligature in Cascadia Code.
-        // If we didn't force upscale that ligatures it would seemingly shrink shorter and shorter, as its
-        // glyph advance is often slightly shorter by a fractional pixel or two compared to our terminal's cells.
-        // It's a trade off that keeps most glyphs "crisp" while retaining support for things like "===".
-        // At least I can't think of any better heuristic for this at the moment...
-        if (cellCount > 2)
-        {
-            const auto advanceScale = _r.fontMetrics.advanceScale;
-            scalingRequired = true;
-            scale = { advanceScale, advanceScale };
-            actualSizeX *= advanceScale;
-        }
-
-        // We need to offset glyphs that are simply outside of our layout box (layoutBox.x/.y)
-        // and additionally downsize glyphs that are entirely too large to fit in.
-        // The DWRITE_OVERHANG_METRICS will tell us how many DIPs the layout box is too large/small.
-        // It contains a positive number if the glyph is outside and a negative one if it's inside
-        // the layout box. For example, given a layoutBox.x/.y (and cell size) of 20/30:
-        // * "M" is the "largest" ASCII character and might be:
-        //     left:    -0.6f
-        //     right:   -0.6f
-        //     top:     -7.6f
-        //     bottom:  -7.4f
-        //   "M" doesn't fill the layout box at all!
-        //   This is because we've rounded up the Terminal's cell size to whole pixels in
-        //   _resolveFontMetrics. top/bottom margins are fairly large because we added the
-        //   chosen font's ascender, descender and line gap metrics to get our line height.
-        //   --> offsetX = 0
-        //   --> offsetY = 0
-        //   --> scale   = 1
-        // * The bar diacritic (U+0336 combining long stroke overlay)
-        //     left:    -9.0f
-        //     top:    -16.3f
-        //     right:    5.6f
-        //     bottom: -11.7f
-        //   right is positive! Our glyph is 5.6 DIPs outside of the layout box and would
-        //   appear cut off during rendering. left is negative at -9, which indicates that
-        //   we can simply shift the glyph by 5.6 DIPs to the left to fit it into our bounds.
-        //   --> offsetX = -5.6f
-        //   --> offsetY = 0
-        //   --> scale   = 1
-        // * Any wide emoji in a narrow cell (U+26A0 warning sign)
-        //     left:     6.7f
-        //     top:     -4.1f
-        //     right:    6.7f
-        //     bottom:  -3.0f
-        //   Our emoji is outside the bounds on both the left and right side and we need to shrink it.
-        //   --> offsetX = 0
-        //   --> offsetY = 0
-        //   --> scale   = layoutBox.y / (layoutBox.y + left + right)
-        //               = 0.69f
-        offset.x = std::max(0.0f, overhang.left) - std::max(0.0f, overhang.right);
-        scaleCenter.x = offset.x;
-        scaleCenter.y = _r.fontMetrics.baselineInDIP;
-
-        if ((actualSizeX - layoutBox.x) > _r.dipPerPixel)
-        {
-            scalingRequired = true;
-            offset.x = (overhang.left - overhang.right) * 0.5f;
-            scale.x = layoutBox.x / actualSizeX;
-            scale.y = scale.x;
-            scaleCenter.x = layoutBox.x * 0.5f;
-        }
-        if (overhang.top > _r.dipPerPixel || overhang.bottom > _r.dipPerPixel)
-        {
-            const auto descend = _r.cellSizeDIP.y - _r.fontMetrics.baselineInDIP;
-            const auto scaleTop = _r.fontMetrics.baselineInDIP / (_r.fontMetrics.baselineInDIP + overhang.top);
-            const auto scaleBottom = descend / (descend + overhang.bottom);
-            scalingRequired = true;
-            scale.x = std::min(scale.x, std::min(scaleTop, scaleBottom));
-            scale.y = scale.x;
-        }
-    }
-
-    auto options = D2D1_DRAW_TEXT_OPTIONS_NONE;
-    // D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT enables a bunch of internal machinery
-    // which doesn't have to run if we know we can't use it anyways in the shader.
-    WI_SetFlagIf(options, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT, coloredGlyph);
-    // !!! IMPORTANT !!!
-    // DirectWrite/2D snaps the baseline to whole pixels, which is something we technically
-    // want (it makes text look crisp), but fails in weird ways if `scalingRequired` is true.
-    // As our scaling matrix's dx/dy (center point) is based on the `origin` coordinates
-    // each cell we draw gets a unique, fractional baseline which gets rounded differently.
-    // I'm not 100% sure why that happens, since `origin` is always in full pixels...
-    // But this causes wide glyphs to draw as tiles that are potentially misaligned vertically by a pixel.
-    // The resulting text rendering looks especially bad for ligatures like "====" in Cascadia Code,
-    // where every single "=" might be blatantly misaligned vertically (same for any box drawings).
-    WI_SetFlagIf(options, D2D1_DRAW_TEXT_OPTIONS_NO_SNAP, scalingRequired);
-
-    // ClearType basically has a 3x higher horizontal resolution. To make our glyphs render the same everywhere,
-    // it's probably for the best to ensure we initially rasterize them on a whole pixel boundary.
-    // (https://en.wikipedia.org/wiki/ClearType#How_ClearType_works)
-    offset.x = roundf(offset.x * _r.pixelPerDIP) * _r.dipPerPixel;
-    // As explained below, we use D2D1_DRAW_TEXT_OPTIONS_NO_SNAP to prevent a weird issue with baseline snapping.
-    // But we do want it technically, so this re-implements baseline snapping... I think?
-    offset.y = roundf(offset.y * _r.pixelPerDIP) * _r.dipPerPixel;
-
-    return CachedGlyphLayout{
-        .textLayout = textLayout,
-        .offset = offset,
-        .scale = scale,
-        .scaleCenter = scaleCenter,
-        .options = options,
-        .scalingRequired = scalingRequired,
-    };
-}
-
-void AtlasEngine::_drawCursor(u16r rect, u32 color, bool clear)
-{
-    // lineWidth is in D2D's DIPs. For instance if we have a 150-200% zoom scale we want to draw a 2px wide line.
-    // At 150% scale lineWidth thus needs to be 1.33333... because at a zoom scale of 1.5 this results in a 2px wide line.
-    const auto lineWidth = std::max(1.0f, static_cast<float>((_r.dpi + USER_DEFAULT_SCREEN_DPI / 2) / USER_DEFAULT_SCREEN_DPI * USER_DEFAULT_SCREEN_DPI) / static_cast<float>(_r.dpi));
-    const auto cursorType = static_cast<CursorType>(_r.cursorOptions.cursorType);
-
-    // `clip` is the rectangle within our texture atlas that's reserved for our cursor texture, ...
-    D2D1_RECT_F clip;
-    clip.left = static_cast<float>(rect.left) * _r.cellSizeDIP.x;
-    clip.top = static_cast<float>(rect.top) * _r.cellSizeDIP.y;
-    clip.right = static_cast<float>(rect.right) * _r.cellSizeDIP.x;
-    clip.bottom = static_cast<float>(rect.bottom) * _r.cellSizeDIP.y;
-
-    // ... whereas `rect` is just the visible (= usually white) portion of our cursor.
-    auto box = clip;
-
-    switch (cursorType)
-    {
-    case CursorType::Legacy:
-        box.top = box.bottom - _r.cellSizeDIP.y * static_cast<float>(_r.cursorOptions.heightPercentage) / 100.0f;
-        break;
-    case CursorType::VerticalBar:
-        box.right = box.left + lineWidth;
-        break;
-    case CursorType::EmptyBox:
-    {
-        // EmptyBox is drawn as a line and unlike filled rectangles those are drawn centered on their
-        // coordinates in such a way that the line border extends half the width to each side.
-        // --> Our coordinates have to be 0.5 DIP off in order to draw a 2px line on a 200% scaling.
-        const auto halfWidth = lineWidth / 2.0f;
-        box.left += halfWidth;
-        box.top += halfWidth;
-        box.right -= halfWidth;
-        box.bottom -= halfWidth;
-        break;
-    }
-    case CursorType::Underscore:
-    case CursorType::DoubleUnderscore:
-        box.top = box.bottom - lineWidth;
-        break;
-    default:
-        break;
-    }
-
-    const auto brush = _brushWithColor(color);
-
-    // We need to clip the area we draw in to ensure we don't
-    // accidentally draw into any neighboring texture atlas tiles.
-    _r.d2dRenderTarget->PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_ALIASED);
-
-    if (clear)
-    {
-        _r.d2dRenderTarget->Clear();
-    }
-
-    if (cursorType == CursorType::EmptyBox)
-    {
-        _r.d2dRenderTarget->DrawRectangle(&box, brush, lineWidth);
-    }
-    else
-    {
-        _r.d2dRenderTarget->FillRectangle(&box, brush);
-    }
-
-    if (cursorType == CursorType::DoubleUnderscore)
-    {
-        const auto offset = lineWidth * 2.0f;
-        box.top -= offset;
-        box.bottom -= offset;
-        _r.d2dRenderTarget->FillRectangle(&box, brush);
-    }
-
-    _r.d2dRenderTarget->PopAxisAlignedClip();
-}
-
-ID2D1Brush* AtlasEngine::_brushWithColor(u32 color)
-{
-    if (_r.brushColor != color)
-    {
-        const auto d2dColor = colorFromU32(color);
-        THROW_IF_FAILED(_r.d2dRenderTarget->CreateSolidColorBrush(&d2dColor, nullptr, _r.brush.put()));
-        _r.brushColor = color;
-    }
-    return _r.brush.get();
-}
-
-AtlasEngine::CachedGlyphLayout::operator bool() const noexcept
-{
-    return static_cast<bool>(textLayout);
-}
-
-void AtlasEngine::CachedGlyphLayout::reset() noexcept
-{
-    textLayout.reset();
-}
-
-void AtlasEngine::CachedGlyphLayout::applyScaling(ID2D1RenderTarget* d2dRenderTarget, D2D1_POINT_2F origin) const noexcept
-{
-    __assume(d2dRenderTarget != nullptr);
-
-    if (scalingRequired)
-    {
-        const D2D1_MATRIX_3X2_F transform{
-            scale.x,
-            0,
-            0,
-            scale.y,
-            (origin.x + scaleCenter.x) * (1.0f - scale.x),
-            (origin.y + scaleCenter.y) * (1.0f - scale.y),
-        };
-        d2dRenderTarget->SetTransform(&transform);
-    }
-}
-
-void AtlasEngine::CachedGlyphLayout::undoScaling(ID2D1RenderTarget* d2dRenderTarget) const noexcept
-{
-    __assume(d2dRenderTarget != nullptr);
-
-    if (scalingRequired)
-    {
-        static constexpr D2D1_MATRIX_3X2_F identity{ 1, 0, 0, 1, 0, 0 };
-        d2dRenderTarget->SetTransform(&identity);
-    }
-}
-
-void AtlasEngine::_d2dPresent()
-{
-    if (!_r.d2dRenderTarget)
-    {
-        _d2dCreateRenderTarget();
-    }
-
-    _d2dDrawDirtyArea();
-
-    _r.glyphQueue.clear();
-    WI_ClearAllFlags(_r.invalidations, RenderInvalidations::Cursor | RenderInvalidations::ConstBuffer);
-}
-
-void AtlasEngine::_d2dCreateRenderTarget()
-{
-    {
-        wil::com_ptr<ID3D11Texture2D> buffer;
-        THROW_IF_FAILED(_r.swapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), buffer.put_void()));
-
-        const auto surface = buffer.query<IDXGISurface>();
-
-        D2D1_RENDER_TARGET_PROPERTIES props{};
-        props.type = D2D1_RENDER_TARGET_TYPE_DEFAULT;
-        props.pixelFormat = { DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED };
-        props.dpiX = static_cast<float>(_r.dpi);
-        props.dpiY = static_cast<float>(_r.dpi);
-        wil::com_ptr<ID2D1RenderTarget> renderTarget;
-        THROW_IF_FAILED(_sr.d2dFactory->CreateDxgiSurfaceRenderTarget(surface.get(), &props, renderTarget.addressof()));
-        _r.d2dRenderTarget = renderTarget.query<ID2D1DeviceContext>();
-
-        // In case _api.realizedAntialiasingMode is D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE we'll
-        // continuously adjust it in AtlasEngine::_drawGlyph. See _drawGlyph.
-        _r.d2dRenderTarget->SetTextAntialiasMode(static_cast<D2D1_TEXT_ANTIALIAS_MODE>(_api.realizedAntialiasingMode));
-    }
-    {
-        static constexpr D2D1_COLOR_F color{ 1, 1, 1, 1 };
-        THROW_IF_FAILED(_r.d2dRenderTarget->CreateSolidColorBrush(&color, nullptr, _r.brush.put()));
-        _r.brushColor = 0xffffffff;
-    }
-}
-
-void AtlasEngine::_d2dDrawDirtyArea()
-{
-    struct CellFlagHandler
-    {
-        CellFlags filter;
-        decltype(&AtlasEngine::_d2dCellFlagRendererCursor) func;
-    };
-
-    static constexpr std::array cellFlagHandlers{
-        // Ordered by lowest to highest "layer".
-        // The selection for instance is drawn on top of underlines, not under them.
-        CellFlagHandler{ CellFlags::Underline, &AtlasEngine::_d2dCellFlagRendererUnderline },
-        CellFlagHandler{ CellFlags::UnderlineDotted, &AtlasEngine::_d2dCellFlagRendererUnderlineDotted },
-        CellFlagHandler{ CellFlags::UnderlineDouble, &AtlasEngine::_d2dCellFlagRendererUnderlineDouble },
-        CellFlagHandler{ CellFlags::Strikethrough, &AtlasEngine::_d2dCellFlagRendererStrikethrough },
-        CellFlagHandler{ CellFlags::Cursor, &AtlasEngine::_d2dCellFlagRendererCursor },
-        CellFlagHandler{ CellFlags::Selected, &AtlasEngine::_d2dCellFlagRendererSelected },
-    };
-
-    auto left = gsl::narrow<u16>(_r.dirtyRect.left);
-    auto top = gsl::narrow<u16>(_r.dirtyRect.top);
-    auto right = gsl::narrow<u16>(_r.dirtyRect.right);
-    auto bottom = gsl::narrow<u16>(_r.dirtyRect.bottom);
-    if constexpr (debugGlyphGenerationPerformance)
-    {
-        left = 0;
-        top = 0;
-        right = _r.cellCount.x;
-        bottom = _r.cellCount.y;
-    }
-
-    _r.d2dRenderTarget->BeginDraw();
-
-    if (WI_IsFlagSet(_r.invalidations, RenderInvalidations::ConstBuffer))
-    {
-        _r.d2dRenderTarget->Clear(colorFromU32(_r.backgroundColor));
-    }
-
-    for (u16 y = top; y < bottom; ++y)
-    {
-        const Cell* cells = _getCell(0, y);
-        const TileHashMap::iterator* cellGlyphMappings = _getCellGlyphMapping(0, y);
-
-        // left/right might intersect a wide glyph. We have to extend left/right
-        // to include the entire glyph so that we can properly render it.
-        // Since a series of identical narrow glyphs (2 spaces for instance) are stored in cellGlyphMappings
-        // just like a single wide glyph (2 references to the same glyph in a row), the only way for us to
-        // know where wide glyphs begin and end is to iterate the entire row and use the stored `cellCount`.
-        u16 beg = 0;
-        for (;;)
-        {
-            const auto cellCount = cellGlyphMappings[beg]->first.data()->attributes.cellCount;
-            const auto begNext = gsl::narrow_cast<u16>(beg + cellCount);
-
-            if (begNext > left)
-            {
-                break;
-            }
-
-            beg = begNext;
-        }
-        auto end = beg;
-        for (;;)
-        {
-            const auto cellCount = cellGlyphMappings[end]->first.data()->attributes.cellCount;
-            end += cellCount;
-
-            if (end >= right)
-            {
-                break;
-            }
-        }
-
-        // Draw background.
-        {
-            _r.d2dRenderTarget->SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_COPY);
-
-            auto x1 = beg;
-            auto x2 = gsl::narrow_cast<u16>(x1 + 1);
-            auto currentColor = cells[x1].color.y;
-
-            for (; x2 < end; ++x2)
-            {
-                const auto color = cells[x2].color.y;
-
-                if (currentColor != color)
-                {
-                    const u16r rect{ x1, y, x2, gsl::narrow_cast<u16>(y + 1) };
-                    _d2dFillRectangle(rect, currentColor);
-                    x1 = x2;
-                    currentColor = color;
-                }
-            }
-
-            {
-                const u16r rect{ x1, y, x2, gsl::narrow_cast<u16>(y + 1) };
-                _d2dFillRectangle(rect, currentColor);
-            }
-
-            _r.d2dRenderTarget->SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_SOURCE_OVER);
-        }
-
-        // Draw text.
-        for (auto x = beg; x < end;)
-        {
-            const auto& it = cellGlyphMappings[x];
-            const u16x2 coord{ x, y };
-            const auto color = cells[x].color.x;
-            x += _d2dDrawGlyph(it, coord, color);
-        }
-
-        // Draw underlines, cursors, selections, etc.
-        for (const auto& handler : cellFlagHandlers)
-        {
-            auto x1 = beg;
-            auto currentFlags = CellFlags::None;
-
-            for (auto x2 = beg; x2 < end; ++x2)
-            {
-                const auto flags = cells[x2].flags & handler.filter;
-
-                if (currentFlags != flags)
-                {
-                    if (currentFlags != CellFlags::None)
-                    {
-                        const u16r rect{ x1, y, x2, gsl::narrow_cast<u16>(y + 1) };
-                        const auto color = cells[x1].color.x;
-                        (this->*handler.func)(rect, color);
-                    }
-
-                    x1 = x2;
-                    currentFlags = flags;
-                }
-            }
-
-            if (currentFlags != CellFlags::None)
-            {
-                const u16r rect{ x1, y, right, gsl::narrow_cast<u16>(y + 1) };
-                const auto color = cells[x1].color.x;
-                (this->*handler.func)(rect, color);
-            }
-        }
-    }
-
-    THROW_IF_FAILED(_r.d2dRenderTarget->EndDraw());
-}
-
-// See _drawGlyph() for reference.
-AtlasEngine::u16 AtlasEngine::_d2dDrawGlyph(const TileHashMap::iterator& it, const u16x2 coord, const u32 color)
-{
-    const auto key = it->first.data();
-    const auto value = it->second.data();
-    const auto charsLength = key->charCount;
-    const auto cellCount = key->attributes.cellCount;
-    const auto textFormat = _getTextFormat(key->attributes.bold, key->attributes.italic);
-    const auto coloredGlyph = WI_IsFlagSet(value->flags, CellFlags::ColoredGlyph);
-
-    auto& cachedLayout = it->second.cachedLayout;
-    if (!cachedLayout)
-    {
-        cachedLayout = _getCachedGlyphLayout(&key->chars[0], charsLength, cellCount, textFormat, coloredGlyph);
-    }
-
-    D2D1_RECT_F rect;
-    rect.left = static_cast<float>(coord.x) * _r.cellSizeDIP.x;
-    rect.top = static_cast<float>(coord.y) * _r.cellSizeDIP.y;
-    rect.right = static_cast<float>(coord.x + cellCount) * _r.cellSizeDIP.x;
-    rect.bottom = rect.top + _r.cellSizeDIP.y;
-
-    D2D1_POINT_2F origin;
-    origin.x = rect.left;
-    origin.y = rect.top;
-
-    _r.d2dRenderTarget->PushAxisAlignedClip(&rect, D2D1_ANTIALIAS_MODE_ALIASED);
-
-    cachedLayout.applyScaling(_r.d2dRenderTarget.get(), origin);
-
-    origin.x += cachedLayout.offset.x;
-    origin.y += cachedLayout.offset.y;
-    _r.d2dRenderTarget->DrawTextLayout(origin, cachedLayout.textLayout.get(), _brushWithColor(color), cachedLayout.options);
-
-    cachedLayout.undoScaling(_r.d2dRenderTarget.get());
-
-    _r.d2dRenderTarget->PopAxisAlignedClip();
-
-    return cellCount;
-}
-
-void AtlasEngine::_d2dDrawLine(u16r rect, u16 pos, u16 width, u32 color, ID2D1StrokeStyle* strokeStyle)
-{
-    const auto w = static_cast<float>(width) * _r.dipPerPixel;
-    const auto y1 = static_cast<float>(rect.top) * _r.cellSizeDIP.y + static_cast<float>(pos) * _r.dipPerPixel + w * 0.5f;
-    const auto x1 = static_cast<float>(rect.left) * _r.cellSizeDIP.x;
-    const auto x2 = static_cast<float>(rect.right) * _r.cellSizeDIP.x;
-    const auto brush = _brushWithColor(color);
-    _r.d2dRenderTarget->DrawLine({ x1, y1 }, { x2, y1 }, brush, w, strokeStyle);
-}
-
-void AtlasEngine::_d2dFillRectangle(u16r rect, u32 color)
-{
-    const D2D1_RECT_F r{
-        .left = static_cast<float>(rect.left) * _r.cellSizeDIP.x,
-        .top = static_cast<float>(rect.top) * _r.cellSizeDIP.y,
-        .right = static_cast<float>(rect.right) * _r.cellSizeDIP.x,
-        .bottom = static_cast<float>(rect.bottom) * _r.cellSizeDIP.y,
-    };
-    const auto brush = _brushWithColor(color);
-    _r.d2dRenderTarget->FillRectangle(r, brush);
-}
-
-void AtlasEngine::_d2dCellFlagRendererCursor(u16r rect, u32 color)
-{
-    _drawCursor(rect, _r.cursorOptions.cursorColor, false);
-}
-
-void AtlasEngine::_d2dCellFlagRendererSelected(u16r rect, u32 color)
-{
-    _d2dFillRectangle(rect, _r.selectionColor);
-}
-
-void AtlasEngine::_d2dCellFlagRendererUnderline(u16r rect, u32 color)
-{
-    _d2dDrawLine(rect, _r.fontMetrics.underlinePos, _r.fontMetrics.underlineWidth, color);
-}
-
-void AtlasEngine::_d2dCellFlagRendererUnderlineDotted(u16r rect, u32 color)
-{
-    if (!_r.dottedStrokeStyle)
-    {
-        static constexpr D2D1_STROKE_STYLE_PROPERTIES props{ .dashStyle = D2D1_DASH_STYLE_CUSTOM };
-        static constexpr FLOAT dashes[2]{ 1, 2 };
-        THROW_IF_FAILED(_sr.d2dFactory->CreateStrokeStyle(&props, &dashes[0], 2, _r.dottedStrokeStyle.addressof()));
-    }
-
-    _d2dDrawLine(rect, _r.fontMetrics.underlinePos, _r.fontMetrics.underlineWidth, color, _r.dottedStrokeStyle.get());
-}
-
-void AtlasEngine::_d2dCellFlagRendererUnderlineDouble(u16r rect, u32 color)
-{
-    _d2dDrawLine(rect, _r.fontMetrics.doubleUnderlinePos.x, _r.fontMetrics.thinLineWidth, color);
-    _d2dDrawLine(rect, _r.fontMetrics.doubleUnderlinePos.y, _r.fontMetrics.thinLineWidth, color);
-}
-
-void AtlasEngine::_d2dCellFlagRendererStrikethrough(u16r rect, u32 color)
-{
-    _d2dDrawLine(rect, _r.fontMetrics.strikethroughPos, _r.fontMetrics.strikethroughWidth, color);
+    const auto colorGlyph = _drawGlyphRun(baseline, &glyphRun, _r.brush.get());
+
+    entry.xy.x = gsl::narrow_cast<u16>(rect.x);
+    entry.xy.y = gsl::narrow_cast<u16>(rect.y);
+    entry.wh.x = gsl::narrow_cast<u16>(rect.w);
+    entry.wh.y = gsl::narrow_cast<u16>(rect.h);
+    entry.offset.x = gsl::narrow_cast<u16>(box.left);
+    entry.offset.y = gsl::narrow_cast<u16>(box.top);
+    entry.colorGlyph = colorGlyph;
 }
