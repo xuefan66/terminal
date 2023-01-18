@@ -90,6 +90,7 @@ public:
 
     // Text insertion functions
     OutputCellIterator Write(const OutputCellIterator givenIt);
+    OutputCellIterator InsertLine(OutputCellIterator it);
 
     OutputCellIterator Write(const OutputCellIterator givenIt,
                              const til::point target,
@@ -246,6 +247,7 @@ private:
 
     wil::unique_virtualalloc_ptr<std::byte> _charBuffer;
     std::vector<ROW> _storage;
+    ROW _scratchRow;
     TextAttribute _currentAttributes;
     til::CoordType _firstRow = 0; // indexes top row (not necessarily 0)
 

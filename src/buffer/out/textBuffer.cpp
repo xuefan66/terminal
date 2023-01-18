@@ -29,7 +29,7 @@ namespace
             const auto rowStride = charsBytes + indicesBytes;
             // 65535*65535 cells would result in a charsAreaSize of 8GiB.
             // --> Use uint64_t so that we can safely do our calculations even on x86.
-            const auto allocSize = gsl::narrow<size_t>(::base::strict_cast<uint64_t>(rowStride) * ::base::strict_cast<uint64_t>(h));
+            const auto allocSize = gsl::narrow<size_t>(::base::strict_cast<uint64_t>(rowStride) * (::base::strict_cast<uint64_t>(h) + 1));
 
             _buffer = wil::unique_virtualalloc_ptr<std::byte>{ static_cast<std::byte*>(VirtualAlloc(nullptr, allocSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)) };
             THROW_IF_NULL_ALLOC(_buffer);
@@ -65,6 +65,11 @@ namespace
         uint16_t height() const noexcept
         {
             return _height;
+        }
+
+        ROW makeRow(TextAttribute attributes = {}) const noexcept
+        {
+            return ROW{ chars(), indices(), width(), attributes };
         }
 
         wil::unique_virtualalloc_ptr<std::byte>&& take() noexcept
@@ -120,6 +125,7 @@ TextBuffer::TextBuffer(til::size screenBufferSize,
         _storage.emplace_back(allocator.chars(), allocator.indices(), allocator.width(), _currentAttributes);
     }
 
+    _scratchRow = allocator.makeRow();
     _charBuffer = allocator.take();
     _UpdateSize();
 }
@@ -390,6 +396,39 @@ OutputCellIterator TextBuffer::Write(const OutputCellIterator givenIt)
     const auto finalIt = Write(givenIt, target);
 
     return finalIt;
+}
+
+// Routine Description:
+// - Writes cells to the output buffer. Writes at the cursor.
+// Arguments:
+// - givenIt - Iterator representing output cell data to write
+// Return Value:
+// - The final position of the iterator
+OutputCellIterator TextBuffer::InsertLine(OutputCellIterator it)
+{
+    const auto& cursor = GetCursor();
+    const auto target = cursor.GetPosition();
+    const auto size = GetSize();
+    til::CoordType written = 0;
+
+    if (!it || !size.IsInBounds(target))
+    {
+        return it;
+    }
+
+    auto& row = GetRowByOffset(target.y);
+    row.CopyTo(_scratchRow);
+
+    const auto end = row.WriteCells(it, target.x);
+    written = end.GetCellDistance(it);
+
+    // TODO copy over attributes
+    const auto trailer = _scratchRow.GetText(target.x, til::CoordTypeMax);
+    row.WriteCells(OutputCellIterator{ trailer }, target.x + written);
+
+    const auto invalidated = row.size() - target.x;
+    TriggerRedraw(Viewport::FromDimensions(target, { invalidated, 1 }));
+    return end;
 }
 
 // Routine Description:
@@ -1005,6 +1044,7 @@ void TextBuffer::Reset()
         // Update the cached size value
         _UpdateSize();
 
+        _scratchRow = allocator.makeRow();
         _charBuffer = allocator.take();
     }
     CATCH_RETURN();

@@ -160,6 +160,23 @@ void ROW::_init() noexcept
 // - fillAttribute - the attribute to use for any newly added, trailing cells
 void ROW::Resize(wchar_t* charsBuffer, uint16_t* charOffsetsBuffer, uint16_t rowWidth, const TextAttribute& fillAttribute)
 {
+    ROW other{ charsBuffer, charOffsetsBuffer, rowWidth, fillAttribute };
+    CopyTo(other);
+    _charsBuffer = std::move(other._charsBuffer);
+    _charsHeap = std::move(other._charsHeap);
+    _chars = std::move(other._chars);
+    _charOffsets = std::move(other._charOffsets);
+    _attr = std::move(other._attr);
+    _columnCount = std::move(other._columnCount);
+    _lineRendition = std::move(other._lineRendition);
+    _wrapForced = std::move(other._wrapForced);
+    _doubleBytePadded = std::move(other._doubleBytePadded);
+}
+
+void ROW::CopyTo(ROW& other)
+{
+    const auto rowWidth = other._columnCount;
+
     // A default-constructed ROW has no cols/chars to copy.
     // It can be detected by the lack of a _charsBuffer (among others).
     //
@@ -185,9 +202,8 @@ void ROW::Resize(wchar_t* charsBuffer, uint16_t* charOffsetsBuffer, uint16_t row
     // Allocate memory for the new `_chars` array.
     // Use the provided charsBuffer if possible, otherwise allocate a `_charsHeap`.
     std::unique_ptr<wchar_t[]> charsHeap;
-    std::span chars{ charsBuffer, rowWidth };
-    const std::span charOffsets{ charOffsetsBuffer, ::base::strict_cast<size_t>(rowWidth) + 1u };
-    if (const uint16_t charsCapacity = charsToCopy + trailingWhitespace; charsCapacity > rowWidth)
+    std::span chars{ other._charsBuffer, rowWidth };
+    if (const uint16_t charsCapacity = charsToCopy + trailingWhitespace; charsCapacity > _columnCount)
     {
         charsHeap = std::make_unique_for_overwrite<wchar_t[]>(charsCapacity);
         chars = { charsHeap.get(), charsCapacity };
@@ -199,28 +215,21 @@ void ROW::Resize(wchar_t* charsBuffer, uint16_t* charOffsetsBuffer, uint16_t row
         std::fill_n(it, trailingWhitespace, L' ');
     }
     {
-        const auto it = std::copy_n(_charOffsets.begin(), colsToCopy, charOffsets.begin());
+        const auto it = std::copy_n(_charOffsets.begin(), colsToCopy, other._charOffsets.begin());
         // The _charOffsets array is 1 wider than newWidth indicates.
         // This is because the extra column contains the past-the-end index into _chars.
         iota_n(it, trailingWhitespace + 1u, charsToCopy);
     }
 
-    _charsBuffer = charsBuffer;
-    _charsHeap = std::move(charsHeap);
-    _chars = chars;
-    _charOffsets = charOffsets;
-    _columnCount = rowWidth;
+    other._charsHeap = std::move(charsHeap);
+    other._chars = chars;
 
-    // .resize_trailing_extent() doesn't work if the vector is empty,
-    // since there's no trailing item that could be extended.
-    if (_attr.empty())
-    {
-        _attr = { rowWidth, fillAttribute };
-    }
-    else
-    {
-        _attr.resize_trailing_extent(rowWidth);
-    }
+    other._attr = _attr;
+    other._attr.resize_trailing_extent(rowWidth);
+
+    other._lineRendition = _lineRendition;
+    other._wrapForced = _wrapForced;
+    other._doubleBytePadded = _doubleBytePadded;
 }
 
 void ROW::TransferAttributes(const til::small_rle<TextAttribute, uint16_t, 1>& attr, til::CoordType newWidth)
@@ -624,6 +633,17 @@ std::wstring_view ROW::GetText() const noexcept
     return { _chars.data(), _charSize() };
 }
 
+std::wstring_view ROW::GetText(til::CoordType columnBegin, til::CoordType columnEnd) const noexcept
+{
+    const auto colBeg = _clampedColumnInclusive(columnBegin);
+    const auto colEnd = _clampedColumnInclusive(columnEnd, colBeg);
+    // Safety: colBeg is now [0, _columnCount].
+    const auto offBeg = _uncheckedCharOffset(colBeg);
+    // Safety: colEnd is now [colBeg, _columnCount].
+    const auto offEnd = _uncheckedCharOffset(colEnd);
+    return { _chars.data() + offBeg, _chars.data() + offEnd };
+}
+
 DelimiterClass ROW::DelimiterClassAt(til::CoordType column, const std::wstring_view& wordDelimiters) const noexcept
 {
     const auto col = _clampedColumn(column);
@@ -651,15 +671,15 @@ constexpr uint16_t ROW::_clampedUint16(T v) noexcept
 }
 
 template<typename T>
-constexpr uint16_t ROW::_clampedColumn(T v) const noexcept
+constexpr uint16_t ROW::_clampedColumn(T v, uint16_t min) const noexcept
 {
-    return static_cast<uint16_t>(std::max(T{ 0 }, std::min<T>(_columnCount - 1u, v)));
+    return static_cast<uint16_t>(std::max(T{ min }, std::min<T>(_columnCount - 1u, v)));
 }
 
 template<typename T>
-constexpr uint16_t ROW::_clampedColumnInclusive(T v) const noexcept
+constexpr uint16_t ROW::_clampedColumnInclusive(T v, uint16_t min) const noexcept
 {
-    return static_cast<uint16_t>(std::max(T{ 0 }, std::min<T>(_columnCount, v)));
+    return static_cast<uint16_t>(std::max(T{ min }, std::min<T>(_columnCount, v)));
 }
 
 // Safety: off must be [0, _charSize()].

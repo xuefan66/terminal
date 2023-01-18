@@ -102,7 +102,16 @@ void AdaptDispatch::_WriteToBuffer(const std::wstring_view string)
         }
 
         const OutputCellIterator it(std::wstring_view{ stringPosition, string.cend() }, attributes);
-        const auto itEnd = textBuffer.WriteLine(it, cursorPosition, wrapAtEOL, lineWidth - 1);
+        OutputCellIterator itEnd;
+
+        if (_modes.test(Mode::InsertReplace))
+        {
+            itEnd = textBuffer.InsertLine(it);
+        }
+        else
+        {
+            itEnd = textBuffer.WriteLine(it, cursorPosition, wrapAtEOL, lineWidth - 1);
+        }
 
         if (itEnd.GetInputDistance(it) == 0)
         {
@@ -1565,6 +1574,9 @@ bool AdaptDispatch::_ModeParamsHelper(const DispatchTypes::ModeParams param, con
 {
     switch (param)
     {
+    case DispatchTypes::ModeParams::IRM_InsertReplaceMode:
+        _modes.set(Mode::InsertReplace, enable);
+        return true;
     case DispatchTypes::ModeParams::DECCKM_CursorKeysMode:
         _terminalInput.SetInputMode(TerminalInput::Mode::CursorKey, enable);
         return !_PassThroughInputModes();
@@ -1681,6 +1693,9 @@ bool AdaptDispatch::RequestMode(const DispatchTypes::ModeParams param)
 
     switch (param)
     {
+    case DispatchTypes::ModeParams::IRM_InsertReplaceMode:
+        enabled = _modes.test(Mode::InsertReplace);
+        return true;
     case DispatchTypes::ModeParams::DECCKM_CursorKeysMode:
         enabled = _terminalInput.GetInputMode(TerminalInput::Mode::CursorKey);
         break;
@@ -2322,7 +2337,7 @@ bool AdaptDispatch::AcceptC1Controls(const bool enabled)
 //   we actually perform. As the appropriate functionality is added to our ANSI support,
 //   we should update this.
 //  X Text cursor enable          DECTCEM     Cursor enabled.
-//    Insert/replace              IRM         Replace mode.
+//  X Insert/replace              IRM         Replace mode.
 //  X Origin                      DECOM       Absolute (cursor origin at upper-left of screen.)
 //  X Autowrap                    DECAWM      Autowrap enabled (matches XTerm behavior).
 //    National replacement        DECNRCM     Multinational set.
@@ -2350,7 +2365,7 @@ bool AdaptDispatch::AcceptC1Controls(const bool enabled)
 bool AdaptDispatch::SoftReset()
 {
     _api.GetTextBuffer().GetCursor().SetIsVisible(true); // Cursor enabled.
-    _modes.reset(Mode::Origin); // Absolute cursor addressing.
+    _modes.reset(Mode::InsertReplace, Mode::Origin); // Replace mode; Absolute cursor addressing.
     _api.SetAutoWrapMode(true); // Wrap at end of line.
     _terminalInput.SetInputMode(TerminalInput::Mode::CursorKey, false); // Normal characters.
     _terminalInput.SetInputMode(TerminalInput::Mode::Keypad, false); // Numeric characters.

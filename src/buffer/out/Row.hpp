@@ -59,6 +59,7 @@ public:
     LineRendition GetLineRendition() const noexcept;
 
     void Reset(const TextAttribute& attr);
+    void CopyTo(ROW& other);
     void Resize(wchar_t* charsBuffer, uint16_t* charOffsetsBuffer, uint16_t rowWidth, const TextAttribute& fillAttribute);
     void TransferAttributes(const til::small_rle<TextAttribute, uint16_t, 1>& attr, til::CoordType newWidth);
 
@@ -78,6 +79,7 @@ public:
     std::wstring_view GlyphAt(til::CoordType column) const noexcept;
     DbcsAttribute DbcsAttrAt(til::CoordType column) const noexcept;
     std::wstring_view GetText() const noexcept;
+    std::wstring_view GetText(til::CoordType columnBegin, til::CoordType columnEnd) const noexcept;
     DelimiterClass DelimiterClassAt(til::CoordType column, const std::wstring_view& wordDelimiters) const noexcept;
 
     auto AttrBegin() const noexcept { return _attr.begin(); }
@@ -98,9 +100,9 @@ private:
     template<typename T>
     static constexpr uint16_t _clampedUint16(T v) noexcept;
     template<typename T>
-    constexpr uint16_t _clampedColumn(T v) const noexcept;
+    constexpr uint16_t _clampedColumn(T v, uint16_t min = 0) const noexcept;
     template<typename T>
-    constexpr uint16_t _clampedColumnInclusive(T v) const noexcept;
+    constexpr uint16_t _clampedColumnInclusive(T v, uint16_t min = 0) const noexcept;
 
     wchar_t _uncheckedChar(size_t off) const noexcept;
     uint16_t _charSize() const noexcept;
