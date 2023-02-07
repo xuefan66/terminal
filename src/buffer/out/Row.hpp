@@ -20,8 +20,6 @@ Revision History:
 
 #pragma once
 
-#include <span>
-
 #include <til/rle.h>
 
 #include "LineRendition.hpp"
@@ -35,6 +33,34 @@ enum class DelimiterClass
     ControlChar,
     DelimiterChar,
     RegularChar
+};
+
+struct RowTextIterator
+{
+    RowTextIterator(std::span<const wchar_t> chars, std::span<const uint16_t> charOffsets, uint16_t offset) noexcept;
+
+    bool operator==(const RowTextIterator& other) const noexcept;
+    RowTextIterator& operator++() noexcept;
+    const RowTextIterator& operator*() const noexcept;
+
+    std::wstring_view Text() const noexcept;
+    til::CoordType Cols() const noexcept;
+    DbcsAttribute DbcsAttr() const noexcept;
+
+private:
+    uint16_t _uncheckedCharOffset(size_t col) const noexcept;
+    bool _uncheckedIsTrailer(size_t col) const noexcept;
+
+    // To simplify the detection of wide glyphs, we don't just store the simple character offset as described
+    // for _charOffsets. Instead we use the most significant bit to indicate whether any column is the
+    // trailing half of a wide glyph. This simplifies many implementation details via _uncheckedIsTrailer.
+    static constexpr uint16_t CharOffsetsTrailer = 0x8000;
+    static constexpr uint16_t CharOffsetsMask = 0x7fff;
+
+    std::span<const wchar_t> _chars;
+    std::span<const uint16_t> _charOffsets;
+    uint16_t _beg;
+    uint16_t _end;
 };
 
 class ROW final
@@ -57,6 +83,8 @@ public:
     bool WasDoubleBytePadded() const noexcept;
     void SetLineRendition(const LineRendition lineRendition) noexcept;
     LineRendition GetLineRendition() const noexcept;
+    RowTextIterator Begin() const noexcept;
+    RowTextIterator End() const noexcept;
 
     void Reset(const TextAttribute& attr);
     void Resize(wchar_t* charsBuffer, uint16_t* charOffsetsBuffer, uint16_t rowWidth, const TextAttribute& fillAttribute);
@@ -66,7 +94,10 @@ public:
     OutputCellIterator WriteCells(OutputCellIterator it, til::CoordType columnBegin, std::optional<bool> wrap = std::nullopt, std::optional<til::CoordType> limitRight = std::nullopt);
     bool SetAttrToEnd(til::CoordType columnBegin, TextAttribute attr);
     void ReplaceAttributes(til::CoordType beginIndex, til::CoordType endIndex, const TextAttribute& newAttr);
-    void ReplaceCharacters(til::CoordType columnBegin, til::CoordType width, const std::wstring_view& chars);
+    til::CoordType PrecedingColumn(til::CoordType column) const noexcept;
+    void ReplaceCharacters(til::CoordType columnBegin, std::wstring_view chars, til::CoordType width);
+    til::CoordType ReplaceCharacters(til::CoordType columnBegin, std::wstring_view& chars);
+    til::CoordType ReplaceCharacters(til::CoordType columnBegin, til::CoordType columnEnd, std::wstring_view& chars, std::span<uint16_t>* charOffsets);
 
     const til::small_rle<TextAttribute, uint16_t, 1>& Attributes() const noexcept;
     TextAttribute GetAttrByColumn(til::CoordType column) const;
