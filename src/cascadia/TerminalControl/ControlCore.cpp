@@ -1624,7 +1624,40 @@ namespace winrt::Microsoft::Terminal::Control::implementation
 
     void ControlCore::ResumeRendering()
     {
-        _renderer->ResetErrorStateAndResume();
+        auto terminalLock = _terminal->LockForWriting();
+        const auto windowWidth = _panelWidth * _compositionScale;
+        const auto windowHeight = _panelHeight * _compositionScale;
+
+        _renderer->RemoveRenderEngine(_renderEngine.get());
+
+        if (_settings->UseAtlasEngine())
+        {
+            _renderEngine = std::make_unique<::Microsoft::Console::Render::AtlasEngine>();
+        }
+        else
+        {
+            _renderEngine = std::make_unique<::Microsoft::Console::Render::DxEngine>();
+        }
+
+        _renderer->AddRenderEngine(_renderEngine.get());
+
+        _updateFont(true);
+
+        LOG_IF_FAILED(_renderEngine->SetWindowSize({ til::math::rounding, windowWidth, windowHeight });
+        _renderEngine->SetSelectionBackground(til::color{ _settings->SelectionBackground() });
+        _renderEngine->SetWarningCallback(std::bind(&ControlCore::_rendererWarning, this, std::placeholders::_1));
+        _renderEngine->SetCallback([this](HANDLE handle) {
+            _renderEngineSwapChainChanged(handle);
+        });
+        _renderEngine->SetRetroTerminalEffect(_settings->RetroTerminalEffect());
+        _renderEngine->SetPixelShaderPath(_settings->PixelShaderPath());
+        _renderEngine->SetForceFullRepaintRendering(_settings->ForceFullRepaintRendering());
+        _renderEngine->SetSoftwareRendering(_settings->SoftwareRendering());
+        _updateAntiAliasingMode();
+        _renderEngine->EnableTransparentBackground(_isBackgroundTransparent());
+
+        THROW_IF_FAILED(_renderEngine->Enable());
+        _renderer->EnablePainting();
     }
 
     bool ControlCore::IsVtMouseModeEnabled() const

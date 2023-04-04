@@ -87,7 +87,6 @@ namespace Microsoft::Console::Render
         void SetBackgroundColorChangedCallback(std::function<void()> pfn);
         void SetFrameColorChangedCallback(std::function<void()> pfn);
         void SetRendererEnteredErrorStateCallback(std::function<void()> pfn);
-        void ResetErrorStateAndResume();
 
         void UpdateHyperlinkHoveredId(uint16_t id) noexcept;
         void UpdateLastHoveredInterval(const std::optional<interval_tree::IntervalTree<til::point, size_t>::interval>& newInterval);

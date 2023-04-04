@@ -1357,14 +1357,6 @@ void Renderer::SetRendererEnteredErrorStateCallback(std::function<void()> pfn)
     _pfnRendererEnteredErrorState = std::move(pfn);
 }
 
-// Method Description:
-// - Attempts to restart the renderer.
-void Renderer::ResetErrorStateAndResume()
-{
-    // because we're not stateful (we could be in the future), all we want to do is reenable painting.
-    EnablePainting();
-}
-
 void Renderer::UpdateHyperlinkHoveredId(uint16_t id) noexcept
 {
     _hyperlinkHoveredId = id;
