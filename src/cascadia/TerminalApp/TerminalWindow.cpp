@@ -874,6 +874,7 @@ namespace winrt::TerminalApp::implementation
                         if (!focusedObject)
                         {
                             focusedObject = _root.try_as<IInspectable>();
+                            break;
                         }
                     }
                 }
