@@ -88,7 +88,7 @@ public:
     void ReplaceAttributes(til::CoordType beginIndex, til::CoordType endIndex, const TextAttribute& newAttr);
     void ReplaceCharacters(til::CoordType columnBegin, til::CoordType width, const std::wstring_view& chars);
     void ReplaceText(RowWriteState& state);
-    til::CoordType CopyRangeFrom(til::CoordType columnBegin, til::CoordType columnLimit, const ROW& other, til::CoordType& otherBegin, til::CoordType otherLimit);
+    til::CoordType CopyTextFrom(til::CoordType columnBegin, til::CoordType columnLimit, const ROW& other, til::CoordType& otherBegin, til::CoordType otherLimit);
 
     til::small_rle<TextAttribute, uint16_t, 1>& Attributes() noexcept;
     const til::small_rle<TextAttribute, uint16_t, 1>& Attributes() const noexcept;
@@ -121,7 +121,8 @@ private:
         bool IsValid() const noexcept;
         void ReplaceCharacters(til::CoordType width) noexcept;
         void ReplaceText() noexcept;
-        void CopyRangeFrom(const std::span<const uint16_t>& charOffsets) noexcept;
+        void CopyTextFrom(const std::span<const uint16_t>& charOffsets) noexcept;
+        static void _copyOffsets(uint16_t* dst, const uint16_t* src, uint16_t size, uint16_t offset) noexcept;
         void Finish();
 
         // Parent pointer.

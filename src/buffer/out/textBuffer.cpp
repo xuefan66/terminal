@@ -960,7 +960,7 @@ void TextBuffer::Reset()
         std::vector<ROW> newStorage;
         auto newBuffer = _allocateBuffer(newSize, _currentAttributes, newStorage);
 
-        // This basically imitates a std::rotate_copy(first, mid, last), but uses ROW::CopyRangeFrom() to do the copying.
+        // This basically imitates a std::rotate_copy(first, mid, last), but uses ROW::CopyTextFrom() to do the copying.
         {
             const auto first = _storage.begin();
             const auto last = _storage.end();
@@ -987,7 +987,7 @@ void TextBuffer::Reset()
                 for (const auto& oldRow : sourceRange)
                 {
                     til::CoordType begin = 0;
-                    dest->CopyRangeFrom(0, til::CoordTypeMax, oldRow, begin, til::CoordTypeMax);
+                    dest->CopyTextFrom(0, til::CoordTypeMax, oldRow, begin, til::CoordTypeMax);
                     dest->TransferAttributes(oldRow.Attributes(), newSize.width);
                     ++dest;
                 }
