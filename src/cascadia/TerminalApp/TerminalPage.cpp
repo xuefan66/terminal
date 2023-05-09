@@ -550,27 +550,28 @@ namespace winrt::TerminalApp::implementation
         // Handle it on a subsequent pass of the UI thread.
         co_await wil::resume_foreground(Dispatcher(), CoreDispatcherPriority::Normal);
 
-        // If the caller provided a CWD, switch to that directory, then switch
+        // If the caller provided a CWD, "switch" to that directory, then switch
         // back once we're done. This looks weird though, because we have to set
         // up the scope_exit _first_. We'll release the scope_exit if we don't
         // actually need it.
-        auto originalCwd{ wil::GetCurrentDirectoryW<std::wstring>() };
-        auto restoreCwd = wil::scope_exit([&originalCwd]() {
+
+        auto originalVirtualCwd{ _WindowProperties.VirtualWorkingDirectory() };
+        auto restoreCwd = wil::scope_exit([&originalVirtualCwd, this]() {
             // ignore errors, we'll just power on through. We'd rather do
             // something rather than fail silently if the directory doesn't
             // actually exist.
-            LOG_IF_WIN32_BOOL_FALSE(SetCurrentDirectory(originalCwd.c_str()));
+            _WindowProperties.VirtualWorkingDirectory(originalVirtualCwd);
         });
+
         if (cwd.empty())
         {
+            // We didn't actually need to change the virtual CWD, so we don't
+            // need to restore it
             restoreCwd.release();
         }
         else
         {
-            // ignore errors, we'll just power on through. We'd rather do
-            // something rather than fail silently if the directory doesn't
-            // actually exist.
-            LOG_IF_WIN32_BOOL_FALSE(SetCurrentDirectory(cwd.c_str()));
+            _WindowProperties.VirtualWorkingDirectory(cwd);
         }
 
         if (auto page{ weakThis.get() })
@@ -1226,10 +1227,13 @@ namespace winrt::TerminalApp::implementation
             // process until later, on another thread, after we've already
             // restored the CWD to its original value.
             auto newWorkingDirectory{ settings.StartingDirectory() };
-            if (newWorkingDirectory.size() == 0 || newWorkingDirectory.size() == 1 &&
-                                                       !(newWorkingDirectory[0] == L'~' || newWorkingDirectory[0] == L'/'))
-            { // We only want to resolve the new WD against the CWD if it doesn't look like a Linux path (see GH#592)
-                auto cwdString{ wil::GetCurrentDirectoryW<std::wstring>() };
+            const bool looksLikeLinux = newWorkingDirectory.size() == 1 &&
+                                        (newWorkingDirectory[0] == L'~' || newWorkingDirectory[0] == L'/');
+
+            // We only want to resolve the new WD against the CWD if it doesn't look like a Linux path (see GH#592)
+            if (!looksLikeLinux)
+            {
+                const auto cwdString{ _WindowProperties.VirtualWorkingDirectory().c_str() };
                 std::filesystem::path cwd{ cwdString };
                 cwd /= settings.StartingDirectory().c_str();
                 newWorkingDirectory = winrt::hstring{ cwd.wstring() };
@@ -4052,6 +4056,33 @@ namespace winrt::TerminalApp::implementation
             if (page->_windowRenameFailedToast != nullptr)
             {
                 page->_windowRenameFailedToast->Open();
+            }
+        }
+    }
+
+    winrt::fire_and_forget TerminalPage::ShowTerminalWorkingDirectory()
+    {
+        auto weakThis{ get_weak() };
+        co_await wil::resume_foreground(Dispatcher());
+        if (auto page{ weakThis.get() })
+        {
+            // If we haven't ever loaded the TeachingTip, then do so now and
+            // create the toast for it.
+            if (page->_windowCwdToast == nullptr)
+            {
+                if (auto tip{ page->FindName(L"WindowCwdToast").try_as<MUX::Controls::TeachingTip>() })
+                {
+                    page->_windowCwdToast = std::make_shared<Toast>(tip);
+                    // Make sure to use the weak ref when setting up this
+                    // callback.
+                    tip.Closed({ page->get_weak(), &TerminalPage::_FocusActiveControl });
+                }
+            }
+            _UpdateTeachingTipTheme(WindowCwdToast().try_as<winrt::Windows::UI::Xaml::FrameworkElement>());
+
+            if (page->_windowCwdToast != nullptr)
+            {
+                page->_windowCwdToast->Open();
             }
         }
     }
