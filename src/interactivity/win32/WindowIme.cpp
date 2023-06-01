@@ -22,7 +22,7 @@ RECT GetImeSuggestionWindowPos()
     const auto& gci = ServiceLocator::LocateGlobals().getConsoleInformation();
     const auto& screenBuffer = gci.GetActiveOutputBuffer();
 
-    const auto coordFont = screenBuffer.GetCurrentFont().GetSize();
+    const auto coordFont = screenBuffer.GetCurrentFont().GetCellSizeInPx();
     auto coordCursor = screenBuffer.GetTextBuffer().GetCursor().GetPosition();
 
     // Adjust the cursor position to be relative to the viewport.

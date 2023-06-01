@@ -42,8 +42,17 @@ CSSLengthPercentage CSSLengthPercentage::FromString(const wchar_t* str)
         }
         else
         {
-            return {};
+            value = 0;
         }
+    }
+
+    // Testing for this ensures Resolve() returns its fallback argument for weird input values.
+    // It also ensures we consistently compare against a default constructed CSSLengthPercentage.
+    // This uses negation to properly handle NAN.
+    if (!(value > 0))
+    {
+        value = 0;
+        referenceFrame = ReferenceFrame::None;
     }
 
     CSSLengthPercentage obj;

@@ -22,29 +22,24 @@ Author(s):
 #include "FontInfo.hpp"
 #include "CSSLengthPercentage.h"
 
-class FontInfoDesired : public FontInfoBase
+struct DesiredCellSize
 {
-public:
-    FontInfoDesired(const std::wstring_view& faceName,
-                    const unsigned char family,
-                    const unsigned int weight,
-                    const float fontSize,
-                    const unsigned int uiCodePage) noexcept;
-    FontInfoDesired(const FontInfo& fiFont) noexcept;
+    CSSLengthPercentage width;
+    CSSLengthPercentage height;
 
-    bool operator==(const FontInfoDesired& other) = delete;
+    constexpr bool operator==(const DesiredCellSize&) const = default;
+};
 
-    void SetCellSize(const CSSLengthPercentage& cellWidth, const CSSLengthPercentage& cellHeight) noexcept;
+struct FontInfoDesired
+{
+    std::wstring faceName;
+    unsigned int weight = 0;
+    unsigned char family = 0;
+    unsigned int codePage = 0;
+    bool setDefaultRasterFont = false;
 
-    const CSSLengthPercentage& GetCellWidth() const noexcept;
-    const CSSLengthPercentage& GetCellHeight() const noexcept;
-    float GetFontSize() const noexcept;
-    til::size GetEngineSize() const noexcept;
+    float fontSize = 0;
+    DesiredCellSize cellSize;
+    
     bool IsDefaultRasterFont() const noexcept;
-
-private:
-    til::size _coordSizeDesired;
-    float _fontSize;
-    CSSLengthPercentage _cellWidth;
-    CSSLengthPercentage _cellHeight;
 };

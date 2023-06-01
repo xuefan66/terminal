@@ -493,7 +493,7 @@ til::size SCREEN_INFORMATION::GetScrollBarSizesInCharacters() const
 
 void SCREEN_INFORMATION::GetRequiredConsoleSizeInPixels(_Out_ til::size* const pRequiredSize) const
 {
-    const auto coordFontSize = GetCurrentFont().GetSize();
+    const auto coordFontSize = GetCurrentFont().GetCellSizeInPx();
 
     // TODO: Assert valid size boundaries
     pRequiredSize->width = GetViewport().Width() * coordFontSize.width;
@@ -508,7 +508,7 @@ til::size SCREEN_INFORMATION::GetScreenFontSize() const
     til::size coordRet = { 1, 1 };
     if (ServiceLocator::LocateGlobals().pRender != nullptr)
     {
-        coordRet = GetCurrentFont().GetSize();
+        coordRet = GetCurrentFont().GetCellSizeInPx();
     }
 
     // For sanity's sake, make sure not to leak 0 out as a possible value. These values are used in division operations.
@@ -2656,6 +2656,20 @@ FontInfo& SCREEN_INFORMATION::GetCurrentFont() noexcept
 const FontInfo& SCREEN_INFORMATION::GetCurrentFont() const noexcept
 {
     return _currentFont;
+}
+
+til::size SCREEN_INFORMATION::GetWhackyConhostFontSize() const noexcept
+{
+    const auto height = _desiredFont.cellSize.height.Resolve(16.0f, 96.0f, 16.0f, 8.0f);
+    auto width = _desiredFont.cellSize.width.Resolve(0, 96.0f, 16.0f, 8.0f);
+
+    if (width == 0)
+    {
+        const auto size = _currentFont.GetCellSizeInPx();
+        width = height / static_cast<float>(size.height) * static_cast<float>(size.width);
+    }
+
+    return til::size{ til::math::rounding, width, height };
 }
 
 // Method Description:

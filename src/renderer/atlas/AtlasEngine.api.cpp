@@ -573,24 +573,16 @@ void AtlasEngine::_updateFont(const wchar_t* faceName, const FontInfoDesired& fo
 
 void AtlasEngine::_resolveFontMetrics(const wchar_t* requestedFaceName, const FontInfoDesired& fontInfoDesired, FontInfo& fontInfo, FontSettings* fontMetrics) const
 {
-    const auto requestedFamily = fontInfoDesired.GetFamily();
-    auto requestedWeight = fontInfoDesired.GetWeight();
-    auto fontSize = fontInfoDesired.GetFontSize();
-    auto requestedSize = fontInfoDesired.GetEngineSize();
-
     if (!requestedFaceName)
     {
-        requestedFaceName = fontInfoDesired.GetFaceName().c_str();
+        requestedFaceName = fontInfoDesired.faceName.c_str();
         if (!requestedFaceName)
         {
             requestedFaceName = L"Consolas";
         }
     }
-    if (!requestedSize.height)
-    {
-        fontSize = 12.0f;
-        requestedSize = { 0, 12 };
-    }
+
+    auto requestedWeight = fontInfoDesired.weight;
     if (!requestedWeight)
     {
         requestedWeight = DWRITE_FONT_WEIGHT_NORMAL;
@@ -626,26 +618,13 @@ void AtlasEngine::_resolveFontMetrics(const wchar_t* requestedFaceName, const Fo
     DWRITE_FONT_METRICS metrics{};
     fontFace->GetMetrics(&metrics);
 
-    // Point sizes are commonly treated at a 72 DPI scale
-    // (including by OpenType), whereas DirectWrite uses 96 DPI.
-    // Since we want the height in px we multiply by the display's DPI.
-    const auto dpi = static_cast<f32>(_api.s->font->dpi);
-    const auto fontSizeInPx = fontSize / 72.0f * dpi;
-
-    const auto designUnitsPerPx = fontSizeInPx / static_cast<f32>(metrics.designUnitsPerEm);
-    const auto ascent = static_cast<f32>(metrics.ascent) * designUnitsPerPx;
-    const auto descent = static_cast<f32>(metrics.descent) * designUnitsPerPx;
-    const auto lineGap = static_cast<f32>(metrics.lineGap) * designUnitsPerPx;
-    const auto underlinePosition = static_cast<f32>(-metrics.underlinePosition) * designUnitsPerPx;
-    const auto underlineThickness = static_cast<f32>(metrics.underlineThickness) * designUnitsPerPx;
-    const auto strikethroughPosition = static_cast<f32>(-metrics.strikethroughPosition) * designUnitsPerPx;
-    const auto strikethroughThickness = static_cast<f32>(metrics.strikethroughThickness) * designUnitsPerPx;
-    const auto advanceHeight = ascent + descent + lineGap;
+    const auto emPerDesignUnit = 1.0f / static_cast<f32>(metrics.designUnitsPerEm);
+    auto advanceHeight = static_cast<f32>(metrics.ascent + metrics.descent + metrics.lineGap) * emPerDesignUnit;
 
     // We use the same character to determine the advance width as CSS for its "ch" unit ("0").
     // According to the CSS spec, if it's impossible to determine the advance width,
     // it must be assumed to be 0.5em wide. em in CSS refers to the computed font-size.
-    auto advanceWidth = 0.5f * fontSizeInPx;
+    auto advanceWidth = 0.5f * emPerDesignUnit;
     {
         static constexpr u32 codePoint = '0';
 
@@ -656,12 +635,50 @@ void AtlasEngine::_resolveFontMetrics(const wchar_t* requestedFaceName, const Fo
         {
             DWRITE_GLYPH_METRICS glyphMetrics{};
             THROW_IF_FAILED(fontFace->GetDesignGlyphMetrics(&glyphIndex, 1, &glyphMetrics, FALSE));
-            advanceWidth = static_cast<f32>(glyphMetrics.advanceWidth) * designUnitsPerPx;
+            advanceWidth = static_cast<f32>(glyphMetrics.advanceWidth) * emPerDesignUnit;
         }
     }
 
-    auto adjustedWidth = std::roundf(fontInfoDesired.GetCellWidth().Resolve(advanceWidth, dpi, fontSizeInPx, advanceWidth));
-    auto adjustedHeight = std::roundf(fontInfoDesired.GetCellHeight().Resolve(advanceHeight, dpi, fontSizeInPx, advanceWidth));
+    auto fontSize = fontInfoDesired.fontSize;
+    // This uses negation to properly handle NAN.
+    if (!(fontSize >= 1.0f))
+    {
+        // conhost traditionally doesn't use the given font-size as the actual font size, but rather
+        // as the cell height in DIPs (= pixels at 96 DPI). To be compatible with that this,
+        // GetFontSize() will return 0, but cellSize.height will contain an absolute value.
+        //
+        // We can turn the cell height into a font size by dividing by the advanceHeight.
+        //
+        // Since we use GetMetrics and GetDesignGlyphMetrics instead of GetGdiCompatibleMetrics and
+        // GetGdiCompatibleGlyphMetrics we might still run into some subtle differences however.
+        // It remains to be seen whether that's an actual issue or not.
+        fontSize = fontInfoDesired.cellSize.height.Resolve(0.0f, 72.0f, 12.0f, 6.0f) / advanceHeight;
+        if (!(fontSize >= 1.0f))
+        {
+            fontSize = 12.0f;
+        }
+    }
+
+    // Point sizes are commonly treated at a 72 DPI scale
+    // (including by OpenType), whereas DirectWrite uses 96 DPI.
+    // Since we want the height in px we multiply by the display's DPI.
+    const auto dpi = static_cast<f32>(_api.s->font->dpi);
+    const auto fontSizeInPx = fontSize / 72.0f * dpi;
+    const auto pxPerDesignUnit = emPerDesignUnit * fontSizeInPx;
+
+    const auto ascent = static_cast<f32>(metrics.ascent) * pxPerDesignUnit;
+    const auto lineGap = static_cast<f32>(metrics.lineGap) * pxPerDesignUnit;
+    const auto underlinePosition = static_cast<f32>(-metrics.underlinePosition) * pxPerDesignUnit;
+    const auto underlineThickness = static_cast<f32>(metrics.underlineThickness) * pxPerDesignUnit;
+    const auto strikethroughPosition = static_cast<f32>(-metrics.strikethroughPosition) * pxPerDesignUnit;
+    const auto strikethroughThickness = static_cast<f32>(metrics.strikethroughThickness) * pxPerDesignUnit;
+
+    // Now that we know the fontSize we can turn the advanceHeight/Width from em into px.
+    advanceWidth *= fontSizeInPx;
+    advanceHeight *= fontSizeInPx;
+
+    auto adjustedWidth = std::roundf(fontInfoDesired.cellSize.width.Resolve(advanceWidth, dpi, fontSizeInPx, advanceWidth));
+    auto adjustedHeight = std::roundf(fontInfoDesired.cellSize.height.Resolve(advanceHeight, dpi, fontSizeInPx, advanceWidth));
 
     // Protection against bad user values in GetCellWidth/Y.
     // AtlasEngine fails hard with 0 cell sizes.
@@ -705,15 +722,7 @@ void AtlasEngine::_resolveFontMetrics(const wchar_t* requestedFaceName, const Fo
         coordSize.width = cellWidth;
         coordSize.height = cellHeight;
 
-        if (requestedSize.width == 0)
-        {
-            // The coordSizeUnscaled parameter to SetFromEngine is used for API functions like GetConsoleFontSize.
-            // Since clients expect that settings the font height to Y yields back a font height of Y,
-            // we're scaling the X relative/proportional to the actual cellWidth/cellHeight ratio.
-            requestedSize.width = gsl::narrow_cast<til::CoordType>(lrintf(fontSize / cellHeight * cellWidth));
-        }
-
-        fontInfo.SetFromEngine(requestedFaceName, requestedFamily, requestedWeight, false, coordSize, requestedSize);
+        fontInfo.SetFromEngine(requestedFaceName, fontInfoDesired.family, requestedWeight, false, coordSize);
     }
 
     if (fontMetrics)

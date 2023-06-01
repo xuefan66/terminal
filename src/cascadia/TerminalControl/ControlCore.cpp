@@ -955,11 +955,9 @@ namespace winrt::Microsoft::Terminal::Control::implementation
     // - Returns true if you need to call _refreshSizeUnderLock().
     bool ControlCore::_setFontSizeUnderLock(float fontSize)
     {
-        // Make sure we have a non-zero font size
-        const auto newSize = std::max(fontSize, 1.0f);
         const auto fontFace = _settings->FontFace();
         const auto fontWeight = _settings->FontWeight();
-        _desiredFont = { fontFace, 0, fontWeight.Weight, newSize, CP_UTF8 };
+        _desiredFont = { fontFace, 0, fontWeight.Weight, fontSize, CP_UTF8 };
         _actualFont = { fontFace, 0, fontWeight.Weight, _desiredFont.GetEngineSize(), CP_UTF8, false };
         _actualFontFaceName = { fontFace };
 
@@ -1183,20 +1181,9 @@ namespace winrt::Microsoft::Terminal::Control::implementation
         // GH#5347 - Don't provide a title for the generated HTML, as many
         // web applications will paste the title first, followed by the HTML
         // content, which is unexpected.
-        const auto htmlData = formats == nullptr || WI_IsFlagSet(formats.Value(), CopyFormat::HTML) ?
-                                  TextBuffer::GenHTML(bufferData,
-                                                      _actualFont.GetUnscaledSize().height,
-                                                      _actualFont.GetFaceName(),
-                                                      bgColor) :
-                                  "";
-
-        // convert to RTF format
-        const auto rtfData = formats == nullptr || WI_IsFlagSet(formats.Value(), CopyFormat::RTF) ?
-                                 TextBuffer::GenRTF(bufferData,
-                                                    _actualFont.GetUnscaledSize().height,
-                                                    _actualFont.GetFaceName(),
-                                                    bgColor) :
-                                 "";
+        const auto copyFormats = formats ? formats.Value() : CopyFormat::All;
+        const auto htmlData = WI_IsFlagSet(copyFormats, CopyFormat::HTML) ? TextBuffer::GenHTML(bufferData, _desiredFont.fontSize, _desiredFont.faceName, bgColor) : "";
+        const auto rtfData = WI_IsFlagSet(copyFormats, CopyFormat::RTF) ? TextBuffer::GenRTF(bufferData, _desiredFont.fontSize, _desiredFont.faceName, bgColor) : "";
 
         // send data up for clipboard
         _CopyToClipboardHandlers(*this,

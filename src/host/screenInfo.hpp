@@ -218,6 +218,7 @@ public:
 
     FontInfo& GetCurrentFont() noexcept;
     const FontInfo& GetCurrentFont() const noexcept;
+    til::size GetWhackyConhostFontSize() const noexcept;
 
     FontInfoDesired& GetDesiredFont() noexcept;
     const FontInfoDesired& GetDesiredFont() const noexcept;

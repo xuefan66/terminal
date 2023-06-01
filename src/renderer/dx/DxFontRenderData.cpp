@@ -192,8 +192,8 @@ DxFontRenderData::DxFontRenderData(::Microsoft::WRL::ComPtr<IDWriteFactory1> dwr
         // Initialize the default font info and build everything from here.
         _defaultFontInfo = DxFontInfo(
             _dwriteFactory.Get(),
-            desired.GetFaceName(),
-            static_cast<DWRITE_FONT_WEIGHT>(desired.GetWeight()),
+            desired.faceName,
+            static_cast<DWRITE_FONT_WEIGHT>(desired.weight),
             DWRITE_FONT_STYLE_NORMAL,
             DWRITE_FONT_STRETCH_NORMAL);
 
@@ -725,6 +725,18 @@ void DxFontRenderData::_BuildFontRenderData(const FontInfoDesired& desired, Font
     DWRITE_GLYPH_METRICS spaceMetrics = { 0 };
     THROW_IF_FAILED(face->GetDesignGlyphMetrics(&spaceGlyphIndex, 1, &spaceMetrics));
 
+    auto fontSize = desired.fontSize;
+    // This uses negation to properly handle NAN.
+    if (!(fontSize >= 1.0f))
+    {
+        const auto advanceHeight = static_cast<float>(fontMetrics.ascent + fontMetrics.descent + fontMetrics.lineGap) / static_cast<float>(fontMetrics.designUnitsPerEm);
+        fontSize = desired.cellSize.height.Resolve(0.0f, 72.0f, 12.0f, 6.0f) / advanceHeight;
+        if (!(fontSize >= 1.0f))
+        {
+            fontSize = 12.0f;
+        }
+    }
+
     // The math here is actually:
     // Requested Size in Points * DPI scaling factor * Points to Pixels scaling factor.
     // - DPI = dots per inch
@@ -737,7 +749,7 @@ void DxFontRenderData::_BuildFontRenderData(const FontInfoDesired& desired, Font
     // - 12 ppi font * (96 dpi / 96 dpi) * (96 dpi / 72 points per inch) = 16 pixels tall font for 100% display (96 dpi is 100%)
     // - 12 ppi font * (144 dpi / 96 dpi) * (96 dpi / 72 points per inch) = 24 pixels tall font for 150% display (144 dpi is 150%)
     // - 12 ppi font * (192 dpi / 96 dpi) * (96 dpi / 72 points per inch) = 32 pixels tall font for 200% display (192 dpi is 200%)
-    const auto heightDesired = desired.GetEngineSize().height / POINTS_PER_INCH * dpiF;
+    const auto heightDesired = fontSize / POINTS_PER_INCH * dpiF;
 
     // The advance is the number of pixels left-to-right (X dimension) for the given font.
     // We're finding a proportional factor here with the design units in "ems", not an actual pixel measurement.
@@ -750,7 +762,7 @@ void DxFontRenderData::_BuildFontRenderData(const FontInfoDesired& desired, Font
     // Now reverse the "em" factor from above to turn the exact pixel width into a (probably) fractional
     // height in pixels of each character. It's easier for us to pad out height and align vertically
     // than it is horizontally.
-    const auto fontSize = roundf(widthAdvanceInPx) / widthAdvance;
+    fontSize = roundf(widthAdvanceInPx) / widthAdvance;
     _fontSize = fontSize;
 
     // Now figure out the basic properties of the character height which include ascent and descent
@@ -803,7 +815,7 @@ void DxFontRenderData::_BuildFontRenderData(const FontInfoDesired& desired, Font
     const auto fullPixelAscent = ceil(ascent + halfGap);
     const auto fullPixelDescent = ceil(descent + halfGap);
     const auto defaultHeight = fullPixelAscent + fullPixelDescent;
-    const auto lineHeight = desired.GetCellHeight().Resolve(defaultHeight, dpiF, heightDesired, widthAdvanceInPx);
+    const auto lineHeight = desired.cellSize.height.Resolve(defaultHeight, dpiF, heightDesired, widthAdvanceInPx);
     const auto baseline = fullPixelAscent + (lineHeight - defaultHeight) / 2.0f;
 
     lineSpacing.height = roundf(lineHeight);
@@ -815,7 +827,7 @@ void DxFontRenderData::_BuildFontRenderData(const FontInfoDesired& desired, Font
 
     _lineSpacing = lineSpacing;
 
-    const auto widthApprox = desired.GetCellWidth().Resolve(widthAdvanceInPx, dpiF, heightDesired, widthAdvanceInPx);
+    const auto widthApprox = desired.cellSize.width.Resolve(widthAdvanceInPx, dpiF, heightDesired, widthAdvanceInPx);
     const auto widthExact = roundf(widthApprox);
 
     // The scaled size needs to represent the pixel box that each character will fit within for the purposes
@@ -824,21 +836,9 @@ void DxFontRenderData::_BuildFontRenderData(const FontInfoDesired& desired, Font
     coordSize.width = static_cast<til::CoordType>(widthExact);
     coordSize.height = static_cast<til::CoordType>(lineSpacing.height);
 
-    // Unscaled is for the purposes of re-communicating this font back to the renderer again later.
-    // As such, we need to give the same original size parameter back here without padding
-    // or rounding or scaling manipulation.
-    const auto unscaled = desired.GetEngineSize();
-
     const auto scaled = coordSize;
 
-    actual.SetFromEngine(_defaultFontInfo.GetFamilyName(),
-                         desired.GetFamily(),
-                         DefaultTextFormat()->GetFontWeight(),
-                         false,
-                         scaled,
-                         unscaled);
-
-    actual.SetFallback(_defaultFontInfo.GetFallback());
+    actual.SetFromEngine(_defaultFontInfo.GetFamilyName(), desired.family, _defaultFontInfo.GetWeight(), false, coordSize);
 
     LineMetrics lineMetrics;
     // There is no font metric for the grid line width, so we use a small
@@ -889,8 +889,7 @@ void DxFontRenderData::_BuildFontRenderData(const FontInfoDesired& desired, Font
     lineMetrics.strikethroughOffset += lineMetrics.strikethroughWidth / 2.0f;
 
     _lineMetrics = lineMetrics;
-
-    _glyphCell = actual.GetSize();
+    _glyphCell = coordSize;
 }
 
 Microsoft::WRL::ComPtr<IDWriteTextFormat> DxFontRenderData::_BuildTextFormat(const DxFontInfo& fontInfo, const std::wstring_view localeName)

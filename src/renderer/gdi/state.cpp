@@ -387,7 +387,7 @@ GdiEngine::~GdiEngine()
 
     // However, we don't want the underline to extend past the bottom of the
     // cell, so we clamp the offset to fit just inside.
-    const auto maxUnderlineOffset = Font.GetSize().height - _lineMetrics.underlineWidth;
+    const auto maxUnderlineOffset = Font.GetCellSizeInPx().height - _lineMetrics.underlineWidth;
     _lineMetrics.underlineOffset2 = std::min(_lineMetrics.underlineOffset2, maxUnderlineOffset);
 
     // But if the resulting gap isn't big enough even to register as a thicker
@@ -398,7 +398,7 @@ GdiEngine::~GdiEngine()
     }
 
     // Now find the size of a 0 in this current font and save it for conversions done later.
-    _coordFontLast = Font.GetSize();
+    _coordFontLast = Font.GetCellSizeInPx();
 
     // Persist font for cleanup (and free existing if necessary)
     if (_hfont != nullptr)
@@ -535,9 +535,6 @@ GdiEngine::~GdiEngine()
     wil::unique_hdc hdcTemp(CreateCompatibleDC(_hdcMemoryContext));
     RETURN_HR_IF_NULL(E_FAIL, hdcTemp.get());
 
-    // Get a special engine size because TT fonts can't specify X or we'll get weird scaling under some circumstances.
-    auto coordFontRequested = FontDesired.GetEngineSize();
-
     // First, check to see if we're asking for the default raster font.
     if (FontDesired.IsDefaultRasterFont())
     {
@@ -551,6 +548,10 @@ GdiEngine::~GdiEngine()
     }
     else
     {
+        const auto dpi = static_cast<float>(iDpi);
+        const auto height = lrintf(FontDesired.cellSize.height.Resolve(16.0f, 1.0f, 16.0f, 8.0f) * dpi);
+        const auto width = lrintf(FontDesired.cellSize.width.Resolve(0, 1.0f, 16.0f, 8.0f) * dpi);
+
         // For future reference, here is the engine weighting and internal details on Windows Font Mapping:
         // https://msdn.microsoft.com/en-us/library/ms969909.aspx
         // More relevant links:
@@ -566,9 +567,9 @@ GdiEngine::~GdiEngine()
         // attention to the font previews to ensure that the font being selected by GDI is exactly the font requested --
         // some monospace fonts look very similar.
         LOGFONTW lf = { 0 };
-        lf.lfHeight = s_ScaleByDpi(coordFontRequested.height, iDpi);
-        lf.lfWidth = s_ScaleByDpi(coordFontRequested.width, iDpi);
-        lf.lfWeight = FontDesired.GetWeight();
+        lf.lfHeight = height;
+        lf.lfWidth = width;
+        lf.lfWeight = FontDesired.weight;
 
         // If we're searching for Terminal, our supported Raster Font, then we must use OEM_CHARSET.
         // If the System's Non-Unicode Setting is set to English (United States) which is 437
@@ -580,18 +581,18 @@ GdiEngine::~GdiEngine()
         // Because the API is affected by the raster/TT status of the actively selected font, we can't have
         // GDI choosing a TT font for us when we ask for Raster. We have to settle for forcing the current system
         // Terminal font to load even if it doesn't have the glyphs necessary such that the APIs continue to work fine.
-        if (FontDesired.GetFaceName() == DEFAULT_RASTER_FONT_FACENAME)
+        if (FontDesired.faceName == DEFAULT_RASTER_FONT_FACENAME)
         {
             lf.lfCharSet = OEM_CHARSET;
         }
         else
         {
             CHARSETINFO csi;
-            if (!TranslateCharsetInfo((DWORD*)IntToPtr(FontDesired.GetCodePage()), &csi, TCI_SRCCODEPAGE))
+            if (!TranslateCharsetInfo((DWORD*)IntToPtr(FontDesired.codePage), &csi, TCI_SRCCODEPAGE))
             {
                 // if we failed to translate from codepage to charset, choose our charset depending on what kind of font we're
                 // dealing with. Raster Fonts need to be presented with the OEM charset, while TT fonts need to be ANSI.
-                csi.ciCharset = FontDesired.IsTrueTypeFont() ? ANSI_CHARSET : OEM_CHARSET;
+                csi.ciCharset = WI_IsFlagSet(FontDesired.family, TMPF_TRUETYPE) ? ANSI_CHARSET : OEM_CHARSET;
             }
 
             lf.lfCharSet = (BYTE)csi.ciCharset;
@@ -602,7 +603,7 @@ GdiEngine::~GdiEngine()
         // NOTE: not using what GDI gave us because some fonts don't quite roundtrip (e.g. MS Gothic and VL Gothic)
         lf.lfPitchAndFamily = (FIXED_PITCH | FF_MODERN);
 
-        FontDesired.FillLegacyNameBuffer(lf.lfFaceName);
+        FillLogFontNameBuffer(FontDesired.faceName, lf.lfFaceName);
 
         // Create font.
         hFont.reset(CreateFontIndirectW(&lf));
@@ -658,21 +659,7 @@ GdiEngine::~GdiEngine()
 
         currentFaceName.resize(faceNameLength - 1); // remove the null terminator (wstring!)
 
-        if (FontDesired.IsDefaultRasterFont())
-        {
-            coordFontRequested = coordFont;
-        }
-        else if (coordFontRequested.width == 0)
-        {
-            coordFontRequested.width = s_ShrinkByDpi(coordFont.width, iDpi);
-        }
-
-        Font.SetFromEngine(currentFaceName,
-                           tm.tmPitchAndFamily,
-                           gsl::narrow_cast<unsigned int>(tm.tmWeight),
-                           FontDesired.IsDefaultRasterFont(),
-                           coordFont,
-                           coordFontRequested);
+        Font.SetFromEngine(currentFaceName, tm.tmPitchAndFamily, gsl::narrow_cast<unsigned int>(tm.tmWeight), FontDesired.IsDefaultRasterFont(), coordFont);
     }
 
     return S_OK;

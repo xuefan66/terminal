@@ -192,7 +192,7 @@ using namespace Microsoft::Console::Types;
         // GetProposedFont can fail if there's no render engine yet.
         // This can happen if we're headless.
         // Just assume that the font is 1x1 in that case.
-        const auto coordFontProposed = SUCCEEDED(hr) ? fiProposed.GetSize() : til::size{ 1, 1 };
+        const auto coordFontProposed = SUCCEEDED(hr) ? fiProposed.GetCellSizeInPx() : til::size{ 1, 1 };
 
         // Then from that font size, we need to calculate the client area.
         // Then from the client area we need to calculate the window area (using the proposed DPI scalar here as well.)

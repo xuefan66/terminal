@@ -27,8 +27,7 @@ DxFontInfo::DxFontInfo(
     _familyName(familyName),
     _weight(weight),
     _style(style),
-    _stretch(stretch),
-    _didFallback(false)
+    _stretch(stretch)
 {
     __assume(dwriteFactory != nullptr);
     THROW_IF_FAILED(dwriteFactory->GetSystemFontCollection(_fontCollection.addressof(), FALSE));
@@ -39,8 +38,7 @@ bool DxFontInfo::operator==(const DxFontInfo& other) const noexcept
     return (_familyName == other._familyName &&
             _weight == other._weight &&
             _style == other._style &&
-            _stretch == other._stretch &&
-            _didFallback == other._didFallback);
+            _stretch == other._stretch);
 }
 
 std::wstring_view DxFontInfo::GetFamilyName() const noexcept
@@ -83,11 +81,6 @@ void DxFontInfo::SetStretch(const DWRITE_FONT_STRETCH stretch) noexcept
     _stretch = stretch;
 }
 
-bool DxFontInfo::GetFallback() const noexcept
-{
-    return _didFallback;
-}
-
 IDWriteFontCollection* DxFontInfo::GetFontCollection() const noexcept
 {
     return _fontCollection.get();
@@ -117,7 +110,6 @@ void DxFontInfo::SetFromEngine(const std::wstring_view familyName,
 [[nodiscard]] Microsoft::WRL::ComPtr<IDWriteFontFace1> DxFontInfo::ResolveFontFaceWithFallback(std::wstring& localeName)
 {
     // First attempt to find exactly what the user asked for.
-    _didFallback = false;
     Microsoft::WRL::ComPtr<IDWriteFontFace1> face{ nullptr };
 
     // GH#10211 - wrap this all up in a try/catch. If the nearby fonts are
@@ -179,7 +171,6 @@ void DxFontInfo::SetFromEngine(const std::wstring_view familyName,
             face = _FindFontFace(localeName);
             if (face)
             {
-                _didFallback = true;
                 break;
             }
         }

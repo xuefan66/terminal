@@ -28,31 +28,32 @@ Author(s):
 class FontInfo : public FontInfoBase
 {
 public:
-    FontInfo(const std::wstring_view& faceName,
-             const unsigned char family,
-             const unsigned int weight,
-             const til::size coordSize,
-             const unsigned int codePage,
-             const bool fSetDefaultRasterFont = false) noexcept;
+    FontInfo(const std::wstring_view& faceName, unsigned char family, unsigned int weight, unsigned int codePage, bool fSetDefaultRasterFont = false) noexcept;
 
     bool operator==(const FontInfo& other) noexcept;
+    
+    til::size GetConhostFontSize() const noexcept
+    {
+        if (FontDesired.IsDefaultRasterFont())
+        {
+            coordFontRequested = coordFont;
+        }
+        else if (coordFontRequested.width == 0)
+        {
+            coordFontRequested.width = s_ShrinkByDpi(coordFont.width, iDpi);
+        }
 
-    til::size GetSize() const noexcept;
-    til::size GetUnscaledSize() const noexcept;
-    void SetFromEngine(const std::wstring_view& faceName,
-                       const unsigned char family,
-                       const unsigned int weight,
-                       const bool fSetDefaultRasterFont,
-                       const til::size coordSize,
-                       const til::size coordSizeUnscaled) noexcept;
-    bool GetFallback() const noexcept;
-    void SetFallback(const bool didFallback) noexcept;
+    }
+    til::size GetCellSizeInPx() const noexcept;
+    void SetFromEngine(const std::wstring_view& faceName, unsigned char family, unsigned int weight, bool fSetDefaultRasterFont, til::size sizeInPx) noexcept;
     void ValidateFont() noexcept;
 
 private:
     void _ValidateCoordSize() noexcept;
 
-    til::size _coordSize;
-    til::size _coordSizeUnscaled;
-    bool _didFallback;
+    til::size _cellSizeInPx;
+    float cellWidthDIP = 0;
+    float cellHeightDIP = 0;
+    float fontSize = 0;
+    til::CoordType dpi = 0;
 };

@@ -36,7 +36,6 @@ namespace Microsoft::Console::Render
         DWRITE_FONT_STRETCH GetStretch() const noexcept;
         void SetStretch(const DWRITE_FONT_STRETCH stretch) noexcept;
 
-        bool GetFallback() const noexcept;
         IDWriteFontCollection* GetFontCollection() const noexcept;
 
         void SetFromEngine(const std::wstring_view familyName,
@@ -65,8 +64,5 @@ namespace Microsoft::Console::Render
         DWRITE_FONT_STRETCH _stretch;
 
         wil::com_ptr<IDWriteFontCollection> _fontCollection;
-
-        // Indicates whether we couldn't match the user request and had to choose from a hard-coded default list.
-        bool _didFallback;
     };
 }
