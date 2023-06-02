@@ -121,6 +121,7 @@ private:
         bool IsValid() const noexcept;
         void ReplaceCharacters(til::CoordType width) noexcept;
         void ReplaceText() noexcept;
+        void ReplaceTextUnicode(size_t ch, std::wstring_view::const_iterator it, const std::wstring_view::const_iterator end);
         void CopyRangeFrom(const std::span<const uint16_t>& charOffsets) noexcept;
         void Finish();
 
