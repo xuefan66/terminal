@@ -82,10 +82,6 @@ ROW::ROW(wchar_t* charsBuffer, uint16_t* charOffsetsBuffer, uint16_t rowWidth, c
     _attr{ rowWidth, fillAttribute },
     _columnCount{ rowWidth }
 {
-    if (_chars.data())
-    {
-        _init();
-    }
 }
 
 void ROW::SetWrapForced(const bool wrap) noexcept
@@ -118,13 +114,12 @@ LineRendition ROW::GetLineRendition() const noexcept
     return _lineRendition;
 }
 
-// Routine Description:
-// - Sets all properties of the ROW to default values
-// Arguments:
-// - Attr - The default attribute (color) to fill
-// Return Value:
-// - <none>
-void ROW::Reset(const TextAttribute& attr)
+bool ROW::IsInitialized() const noexcept
+{
+    return _initialized;
+}
+
+void ROW::Reset(const TextAttribute& attr) noexcept
 {
     _charsHeap.reset();
     _chars = { _charsBuffer, _columnCount };
@@ -134,13 +129,37 @@ void ROW::Reset(const TextAttribute& attr)
     _lineRendition = LineRendition::SingleWidth;
     _wrapForced = false;
     _doubleBytePadded = false;
-    _init();
+    _initialized = false;
 }
 
-void ROW::_init() noexcept
+void ROW::Initialize() noexcept
 {
-    std::fill_n(_chars.begin(), _columnCount, UNICODE_SPACE);
+    // The usage of _charsBuffer instead of _chars is quite intentional, as it
+    // allows _safeReset() to first call Initialize() and then Discard(), ending up
+    // with a ROW that is both not initialized and also consists only of whitespace.
+    std::fill_n(_charsBuffer, _columnCount, UNICODE_SPACE);
     std::iota(_charOffsets.begin(), _charOffsets.end(), uint16_t{ 0 });
+    _initialized = true;
+}
+
+void ROW::Initialize(const ROW& whitespaceRow) noexcept
+{
+    assert(!_initialized);
+    FAIL_FAST_IF(_columnCount != whitespaceRow._columnCount);
+    memcpy(_charsBuffer, whitespaceRow._charsBuffer, CalculateBufferStride(_columnCount));
+    _initialized = true;
+}
+
+// This is somewhat of a weapon of last resort to get the ROW back into a state that doesn't break
+// callers too much. It discards the row (= releases the memory) but still ensures that it at least
+// contains proper whitespace text to avoid any invalid text from being visible or returned anywhere.
+void ROW::_safeReset() noexcept
+{
+    static constexpr TextAttribute emptyAttributes{};
+    // By first calling Initialize() and then Discard() we end up in a state
+    // where _initialized is false, but the contents are still sort of valid.
+    Initialize();
+    Reset(emptyAttributes);
 }
 
 void ROW::TransferAttributes(const til::small_rle<TextAttribute, uint16_t, 1>& attr, til::CoordType newWidth)
@@ -365,7 +384,7 @@ catch (...)
     // Due to this function writing _charOffsets first, then calling _resizeChars (which may throw) and only then finally
     // filling in _chars, we might end up in a situation were _charOffsets contains offsets outside of the _chars array.
     // --> Restore this row to a known "okay"-state.
-    Reset(TextAttribute{});
+    _safeReset();
     throw;
 }
 
@@ -416,7 +435,7 @@ try
 }
 catch (...)
 {
-    Reset(TextAttribute{});
+    _safeReset();
     throw;
 }
 
@@ -546,7 +565,7 @@ try
 }
 catch (...)
 {
-    Reset(TextAttribute{});
+    _safeReset();
     throw;
 }
 

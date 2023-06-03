@@ -877,7 +877,7 @@ void AdaptDispatch::_SelectiveEraseRect(TextBuffer& textBuffer, const til::rect&
     {
         for (auto row = eraseRect.top; row < eraseRect.bottom; row++)
         {
-            auto& rowBuffer = textBuffer.GetRowByOffset(row);
+            auto& rowBuffer = textBuffer.GetMutableRowByOffset(row);
             for (auto col = eraseRect.left; col < eraseRect.right; col++)
             {
                 // Only unprotected cells are affected.
@@ -979,7 +979,7 @@ void AdaptDispatch::_ChangeRectAttributes(TextBuffer& textBuffer, const til::rec
     {
         for (auto row = changeRect.top; row < changeRect.bottom; row++)
         {
-            auto& rowBuffer = textBuffer.GetRowByOffset(row);
+            auto& rowBuffer = textBuffer.GetMutableRowByOffset(row);
             for (auto col = changeRect.left; col < changeRect.right; col++)
             {
                 auto attr = rowBuffer.GetAttrByColumn(col);
@@ -2389,7 +2389,7 @@ void AdaptDispatch::_DoLineFeed(TextBuffer& textBuffer, const bool withReturn, c
 
     // If the line was forced to wrap, set the wrap status.
     // When explicitly moving down a row, clear the wrap status.
-    textBuffer.GetRowByOffset(currentPosition.y).SetWrapForced(wrapForced);
+    textBuffer.GetMutableRowByOffset(currentPosition.y).SetWrapForced(wrapForced);
 
     // If a carriage return was requested, we move to the leftmost column or
     // the left margin, depending on whether we started within the margins.
@@ -2436,7 +2436,7 @@ void AdaptDispatch::_DoLineFeed(TextBuffer& textBuffer, const bool withReturn, c
         {
             auto eraseAttributes = textBuffer.GetCurrentAttributes();
             eraseAttributes.SetStandardErase();
-            textBuffer.GetRowByOffset(newPosition.y).Reset(eraseAttributes);
+            textBuffer.ResetRowByOffset(newPosition.y, eraseAttributes);
         }
     }
     else

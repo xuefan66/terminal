@@ -60,6 +60,27 @@ struct RowWriteState
 class ROW final
 {
 public:
+    // The implicit agreement between ROW and TextBuffer is that each ROW gets a
+    // `columns` sized array of `wchar_t` as its `charsBuffer` argument and a
+    // `columns + 1` sized array of `uint16_t` as its `charOffsetsBuffer` argument.
+    // The former is used as a scratch buffer fitting any BMP codepoints into the
+    // ROW without the need for extra heap allocations and the latter stores the
+    // column-to-start-of-character association. It has 1 more entry than needed
+    // because that one serves as the past-the-end _chars pointer. The expectation
+    // is that these two arrays are given to ROW laid out in memory back-to-back.
+    //
+    // This method exists to make this agreement explicit and serve as a reminder.
+    static constexpr size_t CalculateBufferStride(size_t columns) noexcept
+    {
+        return columns * 4 + 2;
+    }
+
+    // This function returns the size of the first part (the `columns` sized `wchar_t` array).
+    static constexpr size_t CalculateCharsBufferSize(size_t columns) noexcept
+    {
+        return columns * 2;
+    }
+
     ROW() = default;
     ROW(wchar_t* charsBuffer, uint16_t* charOffsetsBuffer, uint16_t rowWidth, const TextAttribute& fillAttribute);
 
@@ -76,7 +97,10 @@ public:
     void SetLineRendition(const LineRendition lineRendition) noexcept;
     LineRendition GetLineRendition() const noexcept;
 
-    void Reset(const TextAttribute& attr);
+    bool IsInitialized() const noexcept;
+    void Reset(const TextAttribute& attr) noexcept;
+    void Initialize() noexcept;
+    void Initialize(const ROW& whitespaceRow) noexcept;
     void TransferAttributes(const til::small_rle<TextAttribute, uint16_t, 1>& attr, til::CoordType newWidth);
 
     til::CoordType NavigateToPrevious(til::CoordType column) const noexcept;
@@ -179,7 +203,7 @@ private:
     uint16_t _uncheckedCharOffset(size_t col) const noexcept;
     bool _uncheckedIsTrailer(size_t col) const noexcept;
 
-    void _init() noexcept;
+    void _safeReset() noexcept;
     void _resizeChars(uint16_t colEndDirty, uint16_t chBegDirty, size_t chEndDirty, uint16_t chEndDirtyOld);
 
     // These fields are a bit "wasteful", but it makes all this a bit more robust against
@@ -233,6 +257,7 @@ private:
     bool _wrapForced = false;
     // Occurs when the user runs out of text to support a double byte character and we're forced to the next line
     bool _doubleBytePadded = false;
+    bool _initialized = false;
 };
 
 #ifdef UNIT_TESTING

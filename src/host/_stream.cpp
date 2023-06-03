@@ -475,7 +475,7 @@ using Microsoft::Console::VirtualTerminal::StateMachine;
 
                         // since you just backspaced yourself back up into the previous row, unset the wrap
                         // flag on the prev row if it was set
-                        textBuffer.GetRowByOffset(CursorPosition.y).SetWrapForced(false);
+                        textBuffer.GetMutableRowByOffset(CursorPosition.y).SetWrapForced(false);
                     }
                 }
                 else if (IS_CONTROL_CHAR(LastChar))
@@ -546,7 +546,7 @@ using Microsoft::Console::VirtualTerminal::StateMachine;
 
                     // since you just backspaced yourself back up into the previous row, unset the wrap flag
                     // on the prev row if it was set
-                    textBuffer.GetRowByOffset(CursorPosition.y).SetWrapForced(false);
+                    textBuffer.GetMutableRowByOffset(CursorPosition.y).SetWrapForced(false);
 
                     Status = AdjustCursorPosition(screenInfo, CursorPosition, dwFlags & WC_KEEP_CURSOR_VISIBLE, psScrollY);
                 }
@@ -582,7 +582,7 @@ using Microsoft::Console::VirtualTerminal::StateMachine;
                 CursorPosition.y = cursor.GetPosition().y + 1;
 
                 // since you just tabbed yourself past the end of the row, set the wrap
-                textBuffer.GetRowByOffset(cursor.GetPosition().y).SetWrapForced(true);
+                textBuffer.GetMutableRowByOffset(cursor.GetPosition().y).SetWrapForced(true);
             }
             else
             {
@@ -629,7 +629,7 @@ using Microsoft::Console::VirtualTerminal::StateMachine;
 
             {
                 // since we explicitly just moved down a row, clear the wrap status on the row we just came from
-                textBuffer.GetRowByOffset(cursor.GetPosition().y).SetWrapForced(false);
+                textBuffer.GetMutableRowByOffset(cursor.GetPosition().y).SetWrapForced(false);
             }
 
             Status = AdjustCursorPosition(screenInfo, CursorPosition, (dwFlags & WC_KEEP_CURSOR_VISIBLE) != 0, psScrollY);
@@ -644,7 +644,7 @@ using Microsoft::Console::VirtualTerminal::StateMachine;
                 fWrapAtEOL)
             {
                 const auto TargetPoint = cursor.GetPosition();
-                auto& Row = textBuffer.GetRowByOffset(TargetPoint.y);
+                auto& Row = textBuffer.GetMutableRowByOffset(TargetPoint.y);
 
                 try
                 {
